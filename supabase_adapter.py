@@ -10,8 +10,8 @@ class SupabaseAdapter:
     def __init__(self):
         # 環境変数から認証情報を読み込み
         load_dotenv()
-        supabase_url = os.getenv("SUPABASE_URL_NIKECHAN_TWITTER")
-        supabase_key = os.getenv("SUPABASE_KEY_NIKECHAN_TWITTER")
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
 
         if not supabase_url or not supabase_key:
             raise ValueError("Supabase credentials not found in environment variables")
