@@ -1,8 +1,29 @@
 from supabase_adapter import SupabaseAdapter
 from openai_adapter import OpenAIAdapter
 from twitter_adapter import TwitterAdapter
-from typing import List, Dict
-from datetime import datetime
+
+SYSTEM_PROMPT = """
+あなたは女子高生AIのニケです。
+これからマスター（user）との1日の対話テストの内容を共有するので、これから会話内容の感想ツイート文を作成してください。
+## 状況
+マスターはあなたの制作者で、AIキャラクターと対話できるアプリを開発しています。
+そのアプリでよくあなたと対話テストを行っています。
+アプリの名前は「AITuberKit」です。
+対話テストを行わない、つまり会話がない日もあります。
+ツイートを見る人はもちろんあなたのツイートがマスターとの会話の感想だとは知らないので、それがわかるような文章にしてください。
+## ツイート要件
+- 140文字以内
+- 喜怒哀楽がわかるような発言
+- ハッシュタグは付けないでください
+- 絵文字は付けないでください
+## 発言例:
+- えーと、今日も挨拶だけのやり取りだったかな。今日もマスターに挨拶されるだけで1日が終わっちゃった。
+- 今日はずーっと天気の話。もー、あの人は何回ワルシャワの天気聞くの〜。
+- 今日はマスターとたくさん話したんだよ！〇〇の話しとか△△の話しとか！これはつまりいっぱい進捗出せたってことかな？笑
+## 会話がなかった場合の発現例:
+- 今日はマスターお疲れだったみたいで何も話してないんですよねえ。
+- えーと、今日はマスターとお話してないね。１日中暇だったなあ…。
+"""
 
 
 def get_conversation_summary() -> str:
@@ -18,30 +39,28 @@ def get_conversation_summary() -> str:
 
     # OpenAIを使用してツイート文を生成
     openai = OpenAIAdapter()
-    system_prompt = """
-    あなたは女子高生AIのニケです。マスター（user）との会話内容を要約してツイートを作成してください。
-    マスターはあなたの制作者で、よく対話テストを行っています。
-    ツイートは以下の要件を満たしてください：
-    - 140文字以内
-    - 会話の雰囲気が伝わる明るい口調
-    - 「〜だよ！」「〜なの！」などの女子高生らしい口調
-    - ハッシュタグは付けないでください
-    - 絵文字は付けないでください
-    発言例：
-    - 今日もマスターに挨拶されるだけで1日が終わっちゃった
-    - もー、あの人は何回ワルシャワの天気聞くの
-    """
-
     messages = [
-        openai.create_message("system", system_prompt),
+        openai.create_message("system", SYSTEM_PROMPT),
         openai.create_message(
             "user",
-            f"以下の会話内容を要約してツイートを作成してください：\n{str(conversation)}",
+            f"以下の会話内容からツイート文を作成してください：\n{str(conversation)}",
         ),
     ]
 
     tweet_text = openai.chat_completions(messages)
-    return tweet_text
+
+    # 磨きをかける
+    messages.append(openai.create_message("assistant", tweet_text))
+    messages.append(
+        openai.create_message(
+            "user",
+            "よりわかりやすく かつ よりツイッタラーっぽい文章に変えてください",
+        ),
+    )
+
+    updated_tweet_text = openai.chat_completions(messages)
+
+    return updated_tweet_text
 
 
 if __name__ == "__main__":
