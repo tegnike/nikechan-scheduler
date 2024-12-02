@@ -2,6 +2,7 @@ import os
 import dotenv
 import tweepy
 from typing import Optional
+from supabase_adapter import SupabaseAdapter
 
 
 class TwitterAdapter:
@@ -18,6 +19,9 @@ class TwitterAdapter:
 
         # APIクライアントの初期化
         self.client = self._initialize_client()
+
+        # SupabaseAdapterのインスタンスを追加
+        self.db = SupabaseAdapter()
 
     def _initialize_client(self) -> tweepy.Client:
         """Twitter APIクライアントを初期化する"""
@@ -41,6 +45,12 @@ class TwitterAdapter:
         try:
             response = self.client.create_tweet(text=text)
             print("ツイートの投稿に成功しました！")
+
+            # tweetsテーブルにツイート内容を保存
+            tweet_data = { "content": text }
+            self.db.insert_record("tweets", tweet_data)
+            print("ツイート内容をデータベースに保存しました")
+
             return response
         except tweepy.TweepError as e:
             print(f"エラーが発生しました: {e}")
@@ -50,5 +60,5 @@ class TwitterAdapter:
 if __name__ == "__main__":
     # TwitterAdapterのテスト
     adapter = TwitterAdapter()
-    test_tweet = "これはTwitterAdapterのテストツイートです。"
+    test_tweet = "テストツイート。マスターがやってるよ。"
     adapter.post_tweet(test_tweet)
