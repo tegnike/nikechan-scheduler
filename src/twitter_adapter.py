@@ -47,7 +47,7 @@ class TwitterAdapter:
             print("ツイートの投稿に成功しました！")
 
             # tweetsテーブルにツイート内容を保存
-            tweet_data = { "content": text }
+            tweet_data = {"content": text}
             self.db.insert_record("tweets", tweet_data)
             print("ツイート内容をデータベースに保存しました")
 
