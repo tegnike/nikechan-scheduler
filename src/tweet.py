@@ -44,9 +44,13 @@ class TweetGenerationState(BaseModel):
     judge_result: TweetSourceJudgeResult = Field(
         default_factory=TweetSourceJudgeResult, description="ツイート生成元の判断結果"
     )
-    pre_generated_tweet: str = Field(default="", description="1次生成されたツイート（磨き前）")
+    pre_generated_tweet: str = Field(
+        default="", description="1次生成されたツイート（磨き前）"
+    )
     generated_tweet: str = Field(default="", description="生成されたツイート")
-    is_tweet_polished: bool = Field(default=False, description="ツイートが磨きをかけられたかどうか")
+    is_tweet_polished: bool = Field(
+        default=False, description="ツイートが磨きをかけられたかどうか"
+    )
 
 
 def fetch_data_node(state: TweetGenerationState) -> Dict[str, Any]:

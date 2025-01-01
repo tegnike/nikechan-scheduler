@@ -1,9 +1,10 @@
-import pprint
-from supabase import create_client
-from typing import Dict, List, Optional
 import os
-from dotenv import load_dotenv
+import pprint
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+from dotenv import load_dotenv
+from supabase import create_client
 
 
 class SupabaseAdapter:

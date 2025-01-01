@@ -1,7 +1,9 @@
 import os
+from typing import Optional
+
 import dotenv
 import tweepy
-from typing import Optional
+
 from supabase_adapter import SupabaseAdapter
 
 
