@@ -1,7 +1,7 @@
 import os
 import pprint
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -71,33 +71,53 @@ class SupabaseAdapter:
             return False
 
     def get_records_by_date_range(
-        self, table_name: str, end_date: Optional[datetime] = None, days: int = 1
+        self,
+        table_name: str,
+        end_date: Optional[datetime] = None,
+        days: int = 1,
+        start_date: Optional[datetime] = None,
     ) -> List[Dict]:
         """指定期間内のレコードを取得
         Args:
             table_name (str): テーブル名
-            end_date (Optional[datetime]): 終了日時（未指定の場合は現在時刻）
-            days (int): 遡る日数（デフォルトは1日）
+            end_date (Optional[datetime]): 終了日時
+            days (int): 遡る日数（start_dateが指定されていない場合に使用）
+            start_date (Optional[datetime]): 開始日時（指定された場合はdaysは無視）
         Returns:
             List[Dict]: 該当するレコードのリスト
         """
         try:
-            if end_date is None:
-                end_date = datetime.now()
+            query = self.client.table(table_name).select("*")
 
-            start_date = end_date - timedelta(days=days)
+            if start_date:
+                query = query.gte("created_at", start_date.isoformat())
+            else:
+                if end_date is None:
+                    end_date = datetime.now(timezone.utc)
+                start_date = end_date - timedelta(days=days)
+                query = query.gte("created_at", start_date.isoformat())
 
-            response = (
-                self.client.table(table_name)
-                .select("*")
-                .gte("created_at", start_date.isoformat())
-                .lte("created_at", end_date.isoformat())
-                .execute()
-            )
+            if end_date:
+                query = query.lt("created_at", end_date.isoformat())
+
+            response = query.execute()
             return response.data
         except Exception as e:
             print(f"Error fetching records by date range: {e}")
             return []
+
+    def get_record_by_condition(
+        self, table_name: str, column: str, value: Any
+    ) -> Optional[Dict]:
+        """指定されたカラムと値に一致するレコードを取得"""
+        try:
+            response = (
+                self.client.table(table_name).select("*").eq(column, value).execute()
+            )
+            return response.data[0] if response.data else None
+        except Exception as e:
+            print(f"Error fetching record by condition: {e}")
+            return None
 
 
 # テスト実行用コード

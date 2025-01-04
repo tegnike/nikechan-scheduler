@@ -1,14 +1,14 @@
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from langchain import hub
 from supabase_adapter import SupabaseAdapter
 
 load_dotenv()
@@ -16,24 +16,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-SYSTEM_PROMPT = """あなたはAITuberのパフォーマンスを分析する専門家です。
-与えられた会話履歴を分析し、以下の2点を特定し、それぞれ文字列のリストで返してください：
-
-1. AIが適切に回答できなかった会話
-2. AIは回答したものの、ユーザーの反応が良くなかった会話
-
-回答例：
-- 「〇〇」という単語を知りませんでした。
-- 最近のニュースを回答できませんでした。
-- 〇〇という質問に〇〇と返しましたが、ユーザの反応が良くありませんでした。
-
-注意点：
-- 客観的な事実に基づいて判断してください。
-- ユーザーの反応から判断できる範囲で評価してください。
-- 建設的なフィードバックを心がけてください。
-- 日本語の以外の言語で対話されている場合は、オリジナルの言語の次に（訳: 〇〇）という形式にしてください。例：「你會說中五嗎（訳: 中国語が話せますか？）」
-"""
 
 
 @dataclass
@@ -76,13 +58,30 @@ class AnalysisState(BaseModel):
     # 制御フラグ
     is_analysis_complete: bool = Field(default=False)
 
+    target_date: date | None = Field(default=None)
+
 
 def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
     """Supabaseからデータを取得するノード"""
     logger.info("データ取得を開始します...")
 
     db = SupabaseAdapter()
-    messages = db.get_records_by_date_range("public_messages", days=1)
+
+    # 指定された日付がある場合は使用し、なければ現在日付を使用
+    target_date = state.target_date or datetime.now(timezone.utc).date()
+
+    # 日本時間の00:00をUTCに変換
+    jst = timezone(timedelta(hours=9))
+    start_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=jst)
+    end_dt = start_dt + timedelta(days=1)
+
+    # UTCに変換
+    start_utc = start_dt.astimezone(timezone.utc)
+    end_utc = end_dt.astimezone(timezone.utc)
+
+    messages = db.get_records_by_date_range(
+        "public_messages", start_date=start_utc, end_date=end_utc
+    )
 
     state.messages = [
         Message(
@@ -168,18 +167,10 @@ def analyze_batch_node(state: AnalysisState) -> Dict[str, Any]:
 
     # LLMで分析
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", SYSTEM_PROMPT),
-            (
-                "user",
-                "以下の会話を分析してください:\n\n" + "\n---\n".join(conversations),
-            ),
-        ]
-    )
+    prompt = hub.pull("tegnike/aituberkit_analysis")
 
     chain = prompt | llm.with_structured_output(AnalysisResult)
-    result = chain.invoke({})
+    result = chain.invoke({"conversations": "\n---\n".join(conversations)})
 
     state.analysis_results.append(dict(result))
     return {
@@ -190,9 +181,47 @@ def analyze_batch_node(state: AnalysisState) -> Dict[str, Any]:
     }
 
 
+def save_analysis_result(result: Dict[str, Any], target_date: date | None) -> None:
+    """分析結果をsummariesテーブルに保存"""
+    db = SupabaseAdapter()
+
+    # target_dateをISO形式に変換
+    iso_target_date = target_date.isoformat() if target_date else None
+
+    # 同じtarget_dateのレコードを検索
+    existing_record = (
+        db.get_record_by_condition("summaries", "target_date", iso_target_date)
+        if iso_target_date
+        else None
+    )
+
+    data = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "target_date": iso_target_date,
+        "tweet": None,
+        "public_message": {
+            "session_count": result["session_count"],
+            "message_count": result["message_count"],
+            "failed_responses": result["failed_responses"],
+            "poor_reactions": result["poor_reactions"],
+            "target_date": iso_target_date,
+        },
+    }
+
+    if existing_record:
+        # 既存レコードがある場合は更新
+        db.update_record("summaries", existing_record["id"], data)
+    else:
+        # 新規レコードとして挿入
+        db.insert_record("summaries", data)
+
+
 class AITuberAnalyzer:
-    def __init__(self):
+    def __init__(self, target_date: str | None = None):
         self.workflow = StateGraph(AnalysisState)
+        self.target_date = (
+            datetime.strptime(target_date, "%Y-%m-%d").date() if target_date else None
+        )
         self._build_graph()
 
     def _build_graph(self):
@@ -221,10 +250,10 @@ class AITuberAnalyzer:
     def run(self) -> Dict[str, Any]:
         """分析を実行し、結果を返す"""
         app = self.workflow.compile()
-        initial_state = AnalysisState()
+        initial_state = AnalysisState(target_date=self.target_date)
         final_state = app.invoke(initial_state)
 
-        return {
+        result = {
             "session_count": final_state["session_count"],
             "message_count": final_state["message_count"],
             "failed_responses": [
@@ -239,9 +268,19 @@ class AITuberAnalyzer:
             ],
         }
 
+        # 分析結果を保存
+        save_analysis_result(result, self.target_date)
+        return result
+
 
 def main():
-    analyzer = AITuberAnalyzer()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AITuber会話分析")
+    parser.add_argument("--date", help="分析対象日 (YYYY-MM-DD形式)")
+
+    args = parser.parse_args()
+    analyzer = AITuberAnalyzer(target_date=args.date)
     result = analyzer.run()
     logger.info(f"Analysis Report:\n{result}")
 
