@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from twitter_adapter import TwitterAdapter
 from supabase_adapter import SupabaseAdapter
 
 load_dotenv()
@@ -189,5 +190,5 @@ if __name__ == "__main__":
         logger.info(f"生成されたツイート:\n{tweet_text}")
 
         # 実際のツイート投稿（必要に応じてコメントアウトを解除）
-        # twitter = TwitterAdapter()
-        # twitter.post_tweet(tweet_text)
+        twitter = TwitterAdapter()
+        twitter.post_tweet(tweet_text)

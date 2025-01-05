@@ -88,7 +88,7 @@ def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
             session_id=msg["session_id"],
             role=msg["role"],
             content=msg["content"],
-            created_at=datetime.fromisoformat(msg["created_at"]),
+            created_at=datetime.strptime(msg["created_at"], "%Y-%m-%dT%H:%M:%S.%f%z"),
         )
         for msg in messages
     ]
