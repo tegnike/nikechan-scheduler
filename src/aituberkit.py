@@ -61,6 +61,25 @@ class AnalysisState(BaseModel):
     target_date: date | None = Field(default=None)
 
 
+def parse_datetime(dt_str: str) -> datetime:
+    """様々な形式の日時文字列を安全にパースする"""
+    try:
+        return datetime.fromisoformat(dt_str)
+    except ValueError:
+        # マイクロ秒が6桁になるようにパディング
+        if '.' in dt_str:
+            main_part, ms_part = dt_str.split('.')
+            ms_timezone = ms_part.split('+')
+            if len(ms_timezone) > 1:
+                ms = ms_timezone[0].ljust(6, '0')
+                return datetime.fromisoformat(f"{main_part}.{ms}+{ms_timezone[1]}")
+            ms_timezone = ms_part.split('-')
+            if len(ms_timezone) > 1:
+                ms = ms_timezone[0].ljust(6, '0')
+                return datetime.fromisoformat(f"{main_part}.{ms}-{ms_timezone[1]}")
+        return datetime.fromisoformat(dt_str)
+
+
 def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
     """Supabaseからデータを取得するノード"""
     logger.info("データ取得を開始します...")
@@ -88,7 +107,7 @@ def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
             session_id=msg["session_id"],
             role=msg["role"],
             content=msg["content"],
-            created_at=datetime.strptime(msg["created_at"], "%Y-%m-%dT%H:%M:%S.%f%z"),
+            created_at=parse_datetime(msg["created_at"]),
         )
         for msg in messages
     ]
