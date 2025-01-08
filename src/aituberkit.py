@@ -1,14 +1,16 @@
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 
+import requests
 from dotenv import load_dotenv
+from langchain import hub
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
-from langchain import hub
 from supabase_adapter import SupabaseAdapter
 
 load_dotenv()
@@ -67,15 +69,15 @@ def parse_datetime(dt_str: str) -> datetime:
         return datetime.fromisoformat(dt_str)
     except ValueError:
         # マイクロ秒が6桁になるようにパディング
-        if '.' in dt_str:
-            main_part, ms_part = dt_str.split('.')
-            ms_timezone = ms_part.split('+')
+        if "." in dt_str:
+            main_part, ms_part = dt_str.split(".")
+            ms_timezone = ms_part.split("+")
             if len(ms_timezone) > 1:
-                ms = ms_timezone[0].ljust(6, '0')
+                ms = ms_timezone[0].ljust(6, "0")
                 return datetime.fromisoformat(f"{main_part}.{ms}+{ms_timezone[1]}")
-            ms_timezone = ms_part.split('-')
+            ms_timezone = ms_part.split("-")
             if len(ms_timezone) > 1:
-                ms = ms_timezone[0].ljust(6, '0')
+                ms = ms_timezone[0].ljust(6, "0")
                 return datetime.fromisoformat(f"{main_part}.{ms}-{ms_timezone[1]}")
         return datetime.fromisoformat(dt_str)
 
@@ -200,6 +202,25 @@ def analyze_batch_node(state: AnalysisState) -> Dict[str, Any]:
     }
 
 
+def get_nijivoice_balance() -> float | str:
+    """NijiVoice APIから残高を取得"""
+    url = "https://api.nijivoice.com/api/platform/v1/balances"
+    headers = {
+        "accept": "application/json",
+        "X-API-KEY": os.getenv("NIJIVOICE_API_KEY"),
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        balance_data = response.json()
+        # remainingBalanceを取得
+        return float(balance_data.get("balances", {}).get("remainingBalance", 0))
+    except Exception as e:
+        logger.error(f"NijiVoice残高取得エラー: {e}")
+        return ""
+
+
 def save_analysis_result(result: Dict[str, Any], target_date: date | None) -> None:
     """分析結果をsummariesテーブルに保存"""
     db = SupabaseAdapter()
@@ -214,6 +235,9 @@ def save_analysis_result(result: Dict[str, Any], target_date: date | None) -> No
         else None
     )
 
+    # NijiVoice残高を取得
+    nijivoice_balance = get_nijivoice_balance()
+
     data = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target_date": iso_target_date,
@@ -224,6 +248,7 @@ def save_analysis_result(result: Dict[str, Any], target_date: date | None) -> No
             "failed_responses": result["failed_responses"],
             "poor_reactions": result["poor_reactions"],
             "target_date": iso_target_date,
+            "nijivoice_balance": nijivoice_balance,
         },
     }
 
