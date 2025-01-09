@@ -11,6 +11,13 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from aituberkit_analyses import (
+    ConversationAnalyses,
+    ConversationAnalysisQuery,
+    DialoguePatternType,
+    DissatisfiedConversationAnalysis,
+    UnknownQuestionAnalysis,
+)
 from supabase_adapter import SupabaseAdapter
 
 load_dotenv()
@@ -34,12 +41,27 @@ class Session:
     messages: List[Message]
 
 
-class AnalysisResult(BaseModel):
+class DetailedAnalysisResult(BaseModel):
     failed_responses: List[str] = Field(
         description="AIが適切に回答できなかった会話のリスト"
     )
     poor_reactions: List[str] = Field(
         description="ユーザーの反応が良くなかった会話のリスト"
+    )
+    conversation_quality: List[str] = Field(description="会話の質に関する分析結果")
+
+
+class ConversationLengthMetrics(BaseModel):
+    total_sessions: int = Field(default=0)
+    total_messages: int = Field(default=0)
+    distribution: Dict[str, int] = Field(
+        default_factory=lambda: {
+            "1-3_turns": 0,
+            "4-7_turns": 0,
+            "8-10_turns": 0,
+            "11-15_turns": 0,
+            "over_15_turns": 0,
+        }
     )
 
 
@@ -50,15 +72,20 @@ class AnalysisState(BaseModel):
     # データ関連
     messages: List[Message] = Field(default_factory=list)
     sessions: List[Session] = Field(default_factory=list)
-    current_batch: List[Session] = Field(default_factory=list)
 
     # 分析結果
-    session_count: int = Field(default=0)
-    message_count: int = Field(default=0)
-    analysis_results: List[Dict[str, Any]] = Field(default_factory=list)
-
-    # 制御フラグ
-    is_analysis_complete: bool = Field(default=False)
+    conversation_analyses: ConversationAnalyses = Field(
+        default_factory=ConversationAnalyses
+    )
+    unknown_question_analysis: UnknownQuestionAnalysis = Field(
+        default_factory=UnknownQuestionAnalysis
+    )
+    dissatisfied_conversation_analysis: DissatisfiedConversationAnalysis = Field(
+        default_factory=DissatisfiedConversationAnalysis
+    )
+    conversation_length_metrics: ConversationLengthMetrics = Field(
+        default_factory=ConversationLengthMetrics
+    )
 
     target_date: date | None = Field(default=None)
 
@@ -114,11 +141,7 @@ def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
         for msg in messages
     ]
 
-    state.message_count = len(state.messages)
-    return {
-        "messages": state.messages,
-        "message_count": state.message_count,
-    }
+    return {"messages": state.messages}
 
 
 def organize_sessions_node(state: AnalysisState) -> Dict[str, Any]:
@@ -133,130 +156,338 @@ def organize_sessions_node(state: AnalysisState) -> Dict[str, Any]:
 
     state.sessions = [
         Session(
-            session_id=session_id, messages=sorted(msgs, key=lambda x: x.created_at)
+            session_id=session_id,
+            messages=sorted(msgs, key=lambda x: x.created_at),
         )
         for session_id, msgs in sessions_dict.items()
     ]
 
-    state.session_count = len(state.sessions)
     return {
         "sessions": state.sessions,
-        "session_count": state.session_count,
-        "message_count": state.message_count,
+        "conversation_length_metrics": calculate_conversation_metrics(state),
     }
 
 
-def analyze_batch_node(state: AnalysisState) -> Dict[str, Any]:
-    """15セッションずつ分析するノード"""
-    logger.info(f"バッチ分析を開始します... (バッチ {len(state.analysis_results) + 1})")
+def calculate_conversation_stats(
+    conversations: List[List[Message]],
+) -> Dict[str, Any]:
+    """定量的なメトリクスを計算"""
+    user_chars: List[int] = []
+    ai_chars: List[int] = []
+    user_questions = ai_questions = 0
 
-    if not state.sessions:
-        state.is_analysis_complete = True
-        logger.info("全セッションの分析が完了しました")
-        logger.info(f"分析結果: {state.analysis_results}")
+    for messages in conversations:
+        user_chars.extend(len(msg.content) for msg in messages if msg.role == "user")
+        ai_chars.extend(len(msg.content) for msg in messages if msg.role == "assistant")
 
-        # ここで、バッチ毎に蓄積された failed_responses および poor_reactions を結合
-        all_failed_responses = []
-        all_poor_reactions = []
-        for r in state.analysis_results:
-            all_failed_responses.extend(r["failed_responses"])
-            all_poor_reactions.extend(r["poor_reactions"])
-
-        return {
-            "is_analysis_complete": True,
-            # まとめた配列のみ返す
-            "failed_responses": all_failed_responses,
-            "poor_reactions": all_poor_reactions,
-            "session_count": state.session_count,
-            "message_count": state.message_count,
-        }
-
-    # 最大15セッションを取得し、残りのセッションを更新
-    batch_size = 15
-    state.current_batch = state.sessions[:batch_size]
-    state.sessions = state.sessions[batch_size:]  # この更新が反映されるように
-
-    logger.info(f"残りセッション数: {len(state.sessions)}")
-
-    # セッションの会話履歴を整形
-    conversations = []
-    for session in state.current_batch:
-        conversation = "\n".join(
-            [f"{msg.role}: {msg.content}" for msg in session.messages]
+        # 質問文をカウント
+        user_questions += sum(
+            1
+            for msg in messages
+            if msg.role == "user" and ("?" in msg.content or "？" in msg.content)
         )
-        conversations.append(f"セッションID: {session.session_id}\n{conversation}\n")
+        ai_questions += sum(
+            1
+            for msg in messages
+            if msg.role == "assistant" and ("?" in msg.content or "？" in msg.content)
+        )
 
-    # LLMで分析
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    prompt = hub.pull("tegnike/aituberkit_analysis")
-
-    chain = prompt | llm.with_structured_output(AnalysisResult)
-    result = chain.invoke({"conversations": "\n---\n".join(conversations)})
-
-    state.analysis_results.append(dict(result))
     return {
-        "analysis_results": state.analysis_results,
-        "sessions": state.sessions,
-        "session_count": state.session_count,
-        "message_count": state.message_count,
+        "user_characters": int(sum(user_chars) / len(user_chars)) if user_chars else 0,
+        "ai_characters": int(sum(ai_chars) / len(ai_chars)) if ai_chars else 0,
+        "user_ai_question_ratio": {
+            "user_questions": user_questions,
+            "ai_questions": ai_questions,
+        },
     }
 
 
-def get_nijivoice_balance() -> float | str:
-    """NijiVoice APIから残高を取得"""
-    url = "https://api.nijivoice.com/api/platform/v1/balances"
-    headers = {
-        "accept": "application/json",
-        "X-API-KEY": os.getenv("NIJIVOICE_API_KEY"),
-    }
+def update_conversation_analysis(analysis, metrics, ai_analysis):
+    """会話分析結果を更新"""
+    analysis.user_characters = metrics["user_characters"]
+    analysis.ai_characters = metrics["ai_characters"]
+    analysis.user_ai_question_ratio = metrics["user_ai_question_ratio"]
+    analysis.topics.extend(ai_analysis.topics)
 
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        balance_data = response.json()
-        # remainingBalanceを取得
-        return float(balance_data.get("balances", {}).get("remainingBalance", 0))
-    except Exception as e:
-        logger.error(f"NijiVoice残高取得エラー: {e}")
-        return ""
+    # QuestionTypeDistributionの各フィールドを更新
+    qt = analysis.question_types
+    ai_qt = ai_analysis.question_types
+
+    qt.yes_no_questions += ai_qt.yes_no_questions
+    qt.explanation_questions += ai_qt.explanation_questions
+    qt.confirmation_questions += ai_qt.confirmation_questions
+    qt.how_to_questions += ai_qt.how_to_questions
+    qt.opinion_questions += ai_qt.opinion_questions
+    qt.choice_questions += ai_qt.choice_questions
+    qt.example_questions += ai_qt.example_questions
+    qt.experience_questions += ai_qt.experience_questions
+    qt.meta_questions += ai_qt.meta_questions
+
+    # DialoguePatternDistributionの更新
+    pattern = ai_analysis.dialogue_pattern
+    dp = analysis.dialogue_patterns
+
+    if pattern == DialoguePatternType.SIMPLE_RESOLUTION:
+        dp.simple_resolution += 1.0
+    elif pattern == DialoguePatternType.DEEP_DIVE:
+        dp.deep_dive += 1.0
+    elif pattern == DialoguePatternType.CORRECTION:
+        dp.correction += 1.0
+    elif pattern == DialoguePatternType.CASUAL_EXPANSION:
+        dp.casual_expansion += 1.0
+    elif pattern == DialoguePatternType.MULTI_TOPIC:
+        dp.multi_topic += 1.0
+    elif pattern == DialoguePatternType.PROBLEM_SOLVING:
+        dp.problem_solving += 1.0
 
 
-def save_analysis_result(result: Dict[str, Any], target_date: date | None) -> None:
+def analyze_conversations(state: AnalysisState) -> Dict[str, Any]:
+    """長い会話・短い会話を分析するノード"""
+    logger.info("会話パターンの分析を開始します...")
+
+    threshold = state.conversation_analyses.conversation_length_threshold
+    analyses = ConversationAnalyses(conversation_length_threshold=threshold)
+
+    # 会話を長さで分類
+    long_conversations = []
+    short_conversations = []
+    for session in state.sessions:
+        if len(session.messages) >= threshold:
+            long_conversations.append(session.messages)
+        else:
+            short_conversations.append(session.messages)
+
+    # メトリクスの計算
+    long_metrics = calculate_conversation_stats(long_conversations)
+    short_metrics = calculate_conversation_stats(short_conversations)
+
+    # AI分析の準備
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    prompt = hub.pull("tegnike/aituberkit_conversation_analysis")
+    chain = prompt | llm.with_structured_output(ConversationAnalysisQuery)
+
+    # 各セッションの分析
+    for session in state.sessions:
+        conversation = f"セッションID: {session.session_id}\n" + "\n".join(
+            f"{msg.role}: {msg.content}" for msg in session.messages
+        )
+        try:
+            ai_analysis = chain.invoke({"conversation": conversation})
+            # dialogue_patternが空の場合はデフォルト値を設定
+            if not ai_analysis.dialogue_pattern:
+                ai_analysis.dialogue_pattern = DialoguePatternType.SIMPLE_RESOLUTION
+                logger.warning(
+                    "dialogue_patternが空でした。デフォルト値を設定します: %s",
+                    ai_analysis.dialogue_pattern,
+                )
+        except Exception as e:
+            logger.error("会話分析中にエラーが発生: %s", e)
+            # エラー時はデフォルト値で分析結果を作成
+            ai_analysis = ConversationAnalysisQuery(
+                topics=[],
+                dialogue_pattern=DialoguePatternType.SIMPLE_RESOLUTION,
+            )
+
+        # 長さに応じて適切な分析結果に追加
+        target_analysis = (
+            analyses.long_conversations
+            if len(session.messages) >= threshold
+            else analyses.short_conversations
+        )
+        update_conversation_analysis(
+            target_analysis,
+            long_metrics if len(session.messages) >= threshold else short_metrics,
+            ai_analysis,
+        )
+
+    return {"conversation_analyses": analyses}
+
+
+def analyze_unknown_questions(state: AnalysisState) -> Dict[str, Any]:
+    """わからないと答えた質問を分析するノード"""
+    logger.info("未回答質問の分析を開始します...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    prompt = hub.pull("tegnike/aituberkit_unknown_questions")
+    chain = prompt | llm.with_structured_output(UnknownQuestionAnalysis)
+    result = UnknownQuestionAnalysis()
+
+    for session in state.sessions:
+        conversation = f"セッションID: {session.session_id}\n" + "\n".join(
+            f"{msg.role}: {msg.content}" for msg in session.messages
+        )
+        analysis = chain.invoke({"conversation": conversation})
+
+        # 質問内容の追加
+        result.questions.extend(analysis.questions)
+
+        # 理由の集計
+        result.unknown_reasons.knowledge_limit += (
+            analysis.unknown_reasons.knowledge_limit
+        )
+        result.unknown_reasons.context_misunderstanding += (
+            analysis.unknown_reasons.context_misunderstanding
+        )
+        result.unknown_reasons.technical_limitation += (
+            analysis.unknown_reasons.technical_limitation
+        )
+        result.unknown_reasons.data_insufficiency += (
+            analysis.unknown_reasons.data_insufficiency
+        )
+        result.unknown_reasons.ethical_restriction += (
+            analysis.unknown_reasons.ethical_restriction
+        )
+
+        # レスポンスパターンの集計
+        result.response_patterns.complete_unknown += (
+            analysis.response_patterns.complete_unknown
+        )
+        result.response_patterns.alternative_suggestion += (
+            analysis.response_patterns.alternative_suggestion
+        )
+        result.response_patterns.additional_info_request += (
+            analysis.response_patterns.additional_info_request
+        )
+        result.response_patterns.partial_answer += (
+            analysis.response_patterns.partial_answer
+        )
+
+    return {"unknown_question_analysis": result}
+
+
+def analyze_dissatisfied_conversations(state: AnalysisState) -> Dict[str, Any]:
+    """未解決のまま終わった会話を分析するノード"""
+    logger.info("未解決会話の分析を開始します...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    prompt = hub.pull("tegnike/aituberkit_dissatisfied_conversations")
+    chain = prompt | llm.with_structured_output(DissatisfiedConversationAnalysis)
+    result = DissatisfiedConversationAnalysis()
+
+    for session in state.sessions:
+        conversation = f"セッションID: {session.session_id}\n" + "\n".join(
+            f"{msg.role}: {msg.content}" for msg in session.messages
+        )
+        analysis = chain.invoke({"conversation": conversation})
+
+        # 会話ペアの追加
+        result.conversation_pairs.extend(analysis.conversation_pairs)
+
+        # 不満タイプの集計
+        result.dissatisfaction_types.response_length_issue += (
+            analysis.dissatisfaction_types.response_length_issue
+        )
+        result.dissatisfaction_types.complexity_issue += (
+            analysis.dissatisfaction_types.complexity_issue
+        )
+        result.dissatisfaction_types.intent_mismatch += (
+            analysis.dissatisfaction_types.intent_mismatch
+        )
+        result.dissatisfaction_types.ambiguous_answer += (
+            analysis.dissatisfaction_types.ambiguous_answer
+        )
+        result.dissatisfaction_types.impractical_answer += (
+            analysis.dissatisfaction_types.impractical_answer
+        )
+
+        # ユーザーパターンの集計
+        result.user_patterns.explicit_complaint += (
+            analysis.user_patterns.explicit_complaint
+        )
+        result.user_patterns.question_rephrasing += (
+            analysis.user_patterns.question_rephrasing
+        )
+        result.user_patterns.abrupt_termination += (
+            analysis.user_patterns.abrupt_termination
+        )
+        result.user_patterns.negative_short_response += (
+            analysis.user_patterns.negative_short_response
+        )
+        result.user_patterns.passive_reaction += analysis.user_patterns.passive_reaction
+
+        # 改善可能性の集計
+        result.improvement_possibilities.length_adjustment += (
+            analysis.improvement_possibilities.length_adjustment
+        )
+        result.improvement_possibilities.detail_adjustment += (
+            analysis.improvement_possibilities.detail_adjustment
+        )
+        result.improvement_possibilities.intent_confirmation += (
+            analysis.improvement_possibilities.intent_confirmation
+        )
+        result.improvement_possibilities.example_addition += (
+            analysis.improvement_possibilities.example_addition
+        )
+        result.improvement_possibilities.system_enhancement += (
+            analysis.improvement_possibilities.system_enhancement
+        )
+
+    return {"dissatisfied_conversation_analysis": result}
+
+
+def calculate_conversation_metrics(state: AnalysisState) -> Dict[str, Any]:
+    """会話の長さに関するメトリクスを計算"""
+    logger.info("会話長メトリクスの計算を開始します...")
+
+    metrics = ConversationLengthMetrics(
+        total_sessions=len(state.sessions), total_messages=len(state.messages)
+    )
+
+    for session in state.sessions:
+        turns = len(session.messages)
+
+        if turns <= 3:
+            metrics.distribution["1-3_turns"] += 1
+        elif turns <= 7:
+            metrics.distribution["4-7_turns"] += 1
+        elif turns <= 10:
+            metrics.distribution["8-10_turns"] += 1
+        elif turns <= 15:
+            metrics.distribution["11-15_turns"] += 1
+        else:
+            metrics.distribution["over_15_turns"] += 1
+
+    return {"conversation_length_metrics": metrics}
+
+
+def save_analysis_result(state: AnalysisState) -> None:
     """分析結果をsummariesテーブルに保存"""
     db = SupabaseAdapter()
 
     # target_dateをISO形式に変換
-    iso_target_date = target_date.isoformat() if target_date else None
+    iso_target_date = state.target_date.isoformat() if state.target_date else None
 
     # 同じtarget_dateのレコードを検索
-    existing_record = (
-        db.get_record_by_condition("summaries", "target_date", iso_target_date)
-        if iso_target_date
-        else None
-    )
+    existing_record = None
+    if iso_target_date:
+        existing_record = db.get_record_by_condition(
+            "summaries", "target_date", iso_target_date
+        )
 
-    # NijiVoice残高を取得
-    nijivoice_balance = get_nijivoice_balance()
+    metrics = state.conversation_length_metrics
+    analyses = state.conversation_analyses
+    unknown = state.unknown_question_analysis
+    dissatisfied = state.dissatisfied_conversation_analysis
 
     data = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target_date": iso_target_date,
         "tweet": None,
-        "public_message": {
-            "session_count": result["session_count"],
-            "message_count": result["message_count"],
-            "failed_responses": result["failed_responses"],
-            "poor_reactions": result["poor_reactions"],
+        "public_messages_test": {
+            "conversation_length_metrics": {
+                "total_sessions": metrics.total_sessions,
+                "total_messages": metrics.total_messages,
+                "distribution": metrics.distribution,
+            },
+            "conversation_analyses": analyses.model_dump(),
+            "unknown_question_analysis": unknown.model_dump(),
+            "dissatisfied_conversation_analysis": dissatisfied.model_dump(),
             "target_date": iso_target_date,
-            "nijivoice_balance": nijivoice_balance,
+            "version": "2",
         },
     }
 
     if existing_record:
-        # 既存レコードがある場合は更新
         db.update_record("summaries", existing_record["id"], data)
     else:
-        # 新規レコードとして挿入
         db.insert_record("summaries", data)
 
 
@@ -272,49 +503,60 @@ class AITuberAnalyzer:
         # ノードの追加
         self.workflow.add_node("fetch_data", fetch_data_node)
         self.workflow.add_node("organize_sessions", organize_sessions_node)
-        self.workflow.add_node("analyze_batch", analyze_batch_node)
+        self.workflow.add_node("calculate_metrics", calculate_conversation_metrics)
+
+        # 分析ノードを個別に追加
+        self.workflow.add_node("analyze_conversations", analyze_conversations)
+        self.workflow.add_node("analyze_unknown_questions", analyze_unknown_questions)
+        self.workflow.add_node(
+            "analyze_dissatisfied_conversations", analyze_dissatisfied_conversations
+        )
 
         # エントリーポイントの設定
         self.workflow.set_entry_point("fetch_data")
 
         # エッジの追加
         self.workflow.add_edge("fetch_data", "organize_sessions")
-        self.workflow.add_edge("organize_sessions", "analyze_batch")
+        self.workflow.add_edge("organize_sessions", "calculate_metrics")
 
-        # analyze_batchノードの条件分岐を修正
-        self.workflow.add_conditional_edges(
-            "analyze_batch",
-            lambda x: END if x.is_analysis_complete else "analyze_batch",
-            {
-                "analyze_batch": "analyze_batch",
-                END: END,
-            },
+        # 並列実行のためのエッジを追加
+        self.workflow.add_edge("calculate_metrics", "analyze_conversations")
+        self.workflow.add_edge("calculate_metrics", "analyze_unknown_questions")
+        self.workflow.add_edge(
+            "calculate_metrics", "analyze_dissatisfied_conversations"
+        )
+
+        # 並列処理の結果を終了ポイントに接続
+        self.workflow.add_edge(
+            [
+                "analyze_conversations",
+                "analyze_unknown_questions",
+                "analyze_dissatisfied_conversations",
+            ],
+            END,
         )
 
     def run(self) -> Dict[str, Any]:
         """分析を実行し、結果を返す"""
         app = self.workflow.compile()
         initial_state = AnalysisState(target_date=self.target_date)
-        final_state = app.invoke(initial_state)
-
-        result = {
-            "session_count": final_state["session_count"],
-            "message_count": final_state["message_count"],
-            "failed_responses": [
-                response
-                for result in final_state["analysis_results"]
-                for response in result["failed_responses"]
-            ],
-            "poor_reactions": [
-                reaction
-                for result in final_state["analysis_results"]
-                for reaction in result["poor_reactions"]
-            ],
-        }
+        final_state_dict = app.invoke(initial_state)
+        final_state = AnalysisState(**final_state_dict)
 
         # 分析結果を保存
-        save_analysis_result(result, self.target_date)
-        return result
+        save_analysis_result(final_state)
+
+        metrics = final_state.conversation_length_metrics
+        analyses = final_state.conversation_analyses
+        unknown = final_state.unknown_question_analysis
+        dissatisfied = final_state.dissatisfied_conversation_analysis
+
+        return {
+            "conversation_length_metrics": metrics.model_dump(),
+            "conversation_analyses": analyses.model_dump(),
+            "unknown_question_analysis": unknown.model_dump(),
+            "dissatisfied_conversation_analysis": dissatisfied.model_dump(),
+        }
 
 
 def main():

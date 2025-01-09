@@ -9,9 +9,12 @@
   "python.terminal.activateEnvironment": false,
   "[python]": {
     "editor.tabSize": 4,
-    "editor.defaultFormatter": "charliermarsh.ruff"
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.rulers": [120]
   },
   "[toml]": {
     "editor.defaultFormatter": "tamasfe.even-better-toml"
-  }
+  },
+  "editor.rulers": [120],
+  "editor.wordWrap": "on"
 }
