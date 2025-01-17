@@ -1,10 +1,8 @@
 import logging
-import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-import requests
 from dotenv import load_dotenv
 from langchain import hub
 from langchain_openai import ChatOpenAI
@@ -481,8 +479,8 @@ def save_analysis_result(state: AnalysisState) -> None:
             "unknown_question_analysis": unknown.model_dump(),
             "dissatisfied_conversation_analysis": dissatisfied.model_dump(),
             "target_date": iso_target_date,
-            "version": "2",
         },
+        "version": "2",
     }
 
     if existing_record:
