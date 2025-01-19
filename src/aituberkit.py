@@ -1,28 +1,125 @@
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from langchain import hub
+from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
-from aituberkit_analyses import (
-    ConversationAnalyses,
-    ConversationAnalysisQuery,
-    DialoguePatternType,
-    DissatisfiedConversationAnalysis,
-    UnknownQuestionAnalysis,
-)
 from supabase_adapter import SupabaseAdapter
 
 load_dotenv()
 
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# カテゴリー定義
+ISSUES_CATEGORY = {
+    "feature_limitations": "機能の制限",
+    "conversation_quality": "会話の質",
+    "usability": "操作性",
+    "response_quality": "応答品質",
+    "user_experience": "ユーザー体験",
+}
+
+TOPICS_CATEGORY = {
+    "technical": "技術・開発",
+    "education": "教育・学習",
+    "hobby": "趣味・エンターテイメント",
+    "business": "仕事・ビジネス",
+    "lifestyle": "生活・健康",
+    "system": "システム関連",
+    "other": "その他",
+}
+
+TIME_CATEGORY = {
+    "morning": "0-3時",
+    "afternoon": "4-7時",
+    "evening": "8-11時",
+    "night": "12-15時",
+    "late_night": "16-19時",
+    "midnight": "20-23時",
+}
+
+TURN_CATEGORY = {
+    "1-3_turns": "1-3回",
+    "4-7_turns": "4-7回",
+    "8-10_turns": "8-10回",
+    "11-15_turns": "11-15回",
+    "over_15_turns": "15回以上",
+}
+
+
+# データモデル定義
+class Issue(BaseModel):
+    category: str
+    solution: str
+    description: str
+
+
+class IssueList(BaseModel):
+    issues: List[Issue]
+
+
+class Language(BaseModel):
+    languages: Dict[str, int] = Field(
+        default_factory=dict,
+        description="言語名（日本語）をキー、出現回数を値とする辞書",
+    )
+
+
+class UserType(BaseModel):
+    new_user: int
+    repeat_user: int
+
+
+class UserMetrics(BaseModel):
+    languages: Language
+    user_types: UserType
+    repeat_rate: float
+    total_users: int
+    total_messages: int
+
+
+class TopicCount(BaseModel):
+    count: int
+    topic: str
+
+
+class TopicMetrics(BaseModel):
+    technical: List[TopicCount] = Field(default_factory=list)
+    education: List[TopicCount] = Field(default_factory=list)
+    hobby: List[TopicCount] = Field(default_factory=list)
+    business: List[TopicCount] = Field(default_factory=list)
+    lifestyle: List[TopicCount] = Field(default_factory=list)
+    system: List[TopicCount] = Field(default_factory=list)
+    other: List[TopicCount] = Field(default_factory=list)
+
+
+class LanguageMetrics(BaseModel):
+    language: str = Field(description="会話で使用されている主要な言語")
+    timezone: str = Field(description="推定されるタイムゾーン")
+    offset: int = Field(description="日本からの時差（時間単位）")
+
+
+class TimeDistribution(BaseModel):
+    count: int
+    avg_turns: float
+
+
+class ConversationMetrics(BaseModel):
+    time_distribution: Dict[str, TimeDistribution]
+    turn_distribution: Dict[str, int]
+
+
+class AnalysisResult(BaseModel):
+    issues: List[Issue]
+    user_metrics: UserMetrics
+    topic_metrics: TopicMetrics
+    conversation_metrics: ConversationMetrics
 
 
 @dataclass
@@ -39,30 +136,6 @@ class Session:
     messages: List[Message]
 
 
-class DetailedAnalysisResult(BaseModel):
-    failed_responses: List[str] = Field(
-        description="AIが適切に回答できなかった会話のリスト"
-    )
-    poor_reactions: List[str] = Field(
-        description="ユーザーの反応が良くなかった会話のリスト"
-    )
-    conversation_quality: List[str] = Field(description="会話の質に関する分析結果")
-
-
-class ConversationLengthMetrics(BaseModel):
-    total_sessions: int = Field(default=0)
-    total_messages: int = Field(default=0)
-    distribution: Dict[str, int] = Field(
-        default_factory=lambda: {
-            "1-3_turns": 0,
-            "4-7_turns": 0,
-            "8-10_turns": 0,
-            "11-15_turns": 0,
-            "over_15_turns": 0,
-        }
-    )
-
-
 class AnalysisState(BaseModel):
     # モデルの設定
     model_config = {"arbitrary_types_allowed": True}
@@ -72,18 +145,10 @@ class AnalysisState(BaseModel):
     sessions: List[Session] = Field(default_factory=list)
 
     # 分析結果
-    conversation_analyses: ConversationAnalyses = Field(
-        default_factory=ConversationAnalyses
-    )
-    unknown_question_analysis: UnknownQuestionAnalysis = Field(
-        default_factory=UnknownQuestionAnalysis
-    )
-    dissatisfied_conversation_analysis: DissatisfiedConversationAnalysis = Field(
-        default_factory=DissatisfiedConversationAnalysis
-    )
-    conversation_length_metrics: ConversationLengthMetrics = Field(
-        default_factory=ConversationLengthMetrics
-    )
+    issues: List[Issue] = Field(default_factory=list)
+    user_metrics: Optional[UserMetrics] = None
+    topic_metrics: Optional[TopicMetrics] = None
+    conversation_metrics: Optional[ConversationMetrics] = None
 
     target_date: date | None = Field(default=None)
 
@@ -93,7 +158,6 @@ def parse_datetime(dt_str: str) -> datetime:
     try:
         return datetime.fromisoformat(dt_str)
     except ValueError:
-        # マイクロ秒が6桁になるようにパディング
         if "." in dt_str:
             main_part, ms_part = dt_str.split(".")
             ms_timezone = ms_part.split("+")
@@ -126,10 +190,12 @@ def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
     end_utc = end_dt.astimezone(timezone.utc)
 
     messages = db.get_records_by_date_range(
-        "public_messages", start_date=start_utc, end_date=end_utc
+        "public_messages",
+        start_date=start_utc,
+        end_date=end_utc,
     )
 
-    state.messages = [
+    messages = [
         Message(
             session_id=msg["session_id"],
             role=msg["role"],
@@ -139,7 +205,7 @@ def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
         for msg in messages
     ]
 
-    return {"messages": state.messages}
+    return {"messages": messages}
 
 
 def organize_sessions_node(state: AnalysisState) -> Dict[str, Any]:
@@ -152,7 +218,7 @@ def organize_sessions_node(state: AnalysisState) -> Dict[str, Any]:
             sessions_dict[msg.session_id] = []
         sessions_dict[msg.session_id].append(msg)
 
-    state.sessions = [
+    sessions = [
         Session(
             session_id=session_id,
             messages=sorted(msgs, key=lambda x: x.created_at),
@@ -160,336 +226,385 @@ def organize_sessions_node(state: AnalysisState) -> Dict[str, Any]:
         for session_id, msgs in sessions_dict.items()
     ]
 
-    return {
-        "sessions": state.sessions,
-        "conversation_length_metrics": calculate_conversation_metrics(state),
-    }
+    return {"sessions": sessions}
 
 
-def calculate_conversation_stats(
-    conversations: List[List[Message]],
-) -> Dict[str, Any]:
-    """定量的なメトリクスを計算"""
-    user_chars: List[int] = []
-    ai_chars: List[int] = []
-    user_questions = ai_questions = 0
+def analyze_user_metrics_node(state: AnalysisState) -> Dict[str, Any]:
+    """ユーザーメトリクスの分析を行うノード"""
+    logger.info("ユーザーメトリクス分析を開始します...")
 
-    for messages in conversations:
-        user_chars.extend(len(msg.content) for msg in messages if msg.role == "user")
-        ai_chars.extend(len(msg.content) for msg in messages if msg.role == "assistant")
-
-        # 質問文をカウント
-        user_questions += sum(
-            1
-            for msg in messages
-            if msg.role == "user" and ("?" in msg.content or "？" in msg.content)
-        )
-        ai_questions += sum(
-            1
-            for msg in messages
-            if msg.role == "assistant" and ("?" in msg.content or "？" in msg.content)
-        )
-
-    return {
-        "user_characters": int(sum(user_chars) / len(user_chars)) if user_chars else 0,
-        "ai_characters": int(sum(ai_chars) / len(ai_chars)) if ai_chars else 0,
-        "user_ai_question_ratio": {
-            "user_questions": user_questions,
-            "ai_questions": ai_questions,
-        },
-    }
-
-
-def update_conversation_analysis(analysis, metrics, ai_analysis):
-    """会話分析結果を更新"""
-    analysis.user_characters = metrics["user_characters"]
-    analysis.ai_characters = metrics["ai_characters"]
-    analysis.user_ai_question_ratio = metrics["user_ai_question_ratio"]
-    analysis.topics.extend(ai_analysis.topics)
-
-    # QuestionTypeDistributionの各フィールドを更新
-    qt = analysis.question_types
-    ai_qt = ai_analysis.question_types
-
-    qt.yes_no_questions += ai_qt.yes_no_questions
-    qt.explanation_questions += ai_qt.explanation_questions
-    qt.confirmation_questions += ai_qt.confirmation_questions
-    qt.how_to_questions += ai_qt.how_to_questions
-    qt.opinion_questions += ai_qt.opinion_questions
-    qt.choice_questions += ai_qt.choice_questions
-    qt.example_questions += ai_qt.example_questions
-    qt.experience_questions += ai_qt.experience_questions
-    qt.meta_questions += ai_qt.meta_questions
-
-    # DialoguePatternDistributionの更新
-    pattern = ai_analysis.dialogue_pattern
-    dp = analysis.dialogue_patterns
-
-    if pattern == DialoguePatternType.SIMPLE_RESOLUTION:
-        dp.simple_resolution += 1.0
-    elif pattern == DialoguePatternType.DEEP_DIVE:
-        dp.deep_dive += 1.0
-    elif pattern == DialoguePatternType.CORRECTION:
-        dp.correction += 1.0
-    elif pattern == DialoguePatternType.CASUAL_EXPANSION:
-        dp.casual_expansion += 1.0
-    elif pattern == DialoguePatternType.MULTI_TOPIC:
-        dp.multi_topic += 1.0
-    elif pattern == DialoguePatternType.PROBLEM_SOLVING:
-        dp.problem_solving += 1.0
-
-
-def analyze_conversations(state: AnalysisState) -> Dict[str, Any]:
-    """長い会話・短い会話を分析するノード"""
-    logger.info("会話パターンの分析を開始します...")
-
-    threshold = state.conversation_analyses.conversation_length_threshold
-    analyses = ConversationAnalyses(conversation_length_threshold=threshold)
-
-    # 会話を長さで分類
-    long_conversations = []
-    short_conversations = []
-    for session in state.sessions:
-        if len(session.messages) >= threshold:
-            long_conversations.append(session.messages)
-        else:
-            short_conversations.append(session.messages)
-
-    # メトリクスの計算
-    long_metrics = calculate_conversation_stats(long_conversations)
-    short_metrics = calculate_conversation_stats(short_conversations)
-
-    # AI分析の準備
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    prompt = hub.pull("tegnike/aituberkit_conversation_analysis")
-    chain = prompt | llm.with_structured_output(ConversationAnalysisQuery)
-
-    # 各セッションの分析
-    for session in state.sessions:
-        conversation = f"セッションID: {session.session_id}\n" + "\n".join(
-            f"{msg.role}: {msg.content}" for msg in session.messages
-        )
-        try:
-            ai_analysis = chain.invoke({"conversation": conversation})
-            # dialogue_patternが空の場合はデフォルト値を設定
-            if not ai_analysis.dialogue_pattern:
-                ai_analysis.dialogue_pattern = DialoguePatternType.SIMPLE_RESOLUTION
-                logger.warning(
-                    "dialogue_patternが空でした。デフォルト値を設定します: %s",
-                    ai_analysis.dialogue_pattern,
-                )
-        except Exception as e:
-            logger.error("会話分析中にエラーが発生: %s", e)
-            # エラー時はデフォルト値で分析結果を作成
-            ai_analysis = ConversationAnalysisQuery(
-                topics=[],
-                dialogue_pattern=DialoguePatternType.SIMPLE_RESOLUTION,
-            )
-
-        # 長さに応じて適切な分析結果に追加
-        target_analysis = (
-            analyses.long_conversations
-            if len(session.messages) >= threshold
-            else analyses.short_conversations
-        )
-        update_conversation_analysis(
-            target_analysis,
-            long_metrics if len(session.messages) >= threshold else short_metrics,
-            ai_analysis,
-        )
-
-    return {"conversation_analyses": analyses}
-
-
-def analyze_unknown_questions(state: AnalysisState) -> Dict[str, Any]:
-    """わからないと答えた質問を分析するノード"""
-    logger.info("未回答質問の分析を開始します...")
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    prompt = hub.pull("tegnike/aituberkit_unknown_questions")
-    chain = prompt | llm.with_structured_output(UnknownQuestionAnalysis)
-    result = UnknownQuestionAnalysis()
-
-    for session in state.sessions:
-        conversation = f"セッションID: {session.session_id}\n" + "\n".join(
-            f"{msg.role}: {msg.content}" for msg in session.messages
-        )
-        analysis = chain.invoke({"conversation": conversation})
-
-        # 質問内容の追加
-        result.questions.extend(analysis.questions)
-
-        # 理由の集計
-        result.unknown_reasons.knowledge_limit += (
-            analysis.unknown_reasons.knowledge_limit
-        )
-        result.unknown_reasons.context_misunderstanding += (
-            analysis.unknown_reasons.context_misunderstanding
-        )
-        result.unknown_reasons.technical_limitation += (
-            analysis.unknown_reasons.technical_limitation
-        )
-        result.unknown_reasons.data_insufficiency += (
-            analysis.unknown_reasons.data_insufficiency
-        )
-        result.unknown_reasons.ethical_restriction += (
-            analysis.unknown_reasons.ethical_restriction
-        )
-
-        # レスポンスパターンの集計
-        result.response_patterns.complete_unknown += (
-            analysis.response_patterns.complete_unknown
-        )
-        result.response_patterns.alternative_suggestion += (
-            analysis.response_patterns.alternative_suggestion
-        )
-        result.response_patterns.additional_info_request += (
-            analysis.response_patterns.additional_info_request
-        )
-        result.response_patterns.partial_answer += (
-            analysis.response_patterns.partial_answer
-        )
-
-    return {"unknown_question_analysis": result}
-
-
-def analyze_dissatisfied_conversations(state: AnalysisState) -> Dict[str, Any]:
-    """未解決のまま終わった会話を分析するノード"""
-    logger.info("未解決会話の分析を開始します...")
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    prompt = hub.pull("tegnike/aituberkit_dissatisfied_conversations")
-    chain = prompt | llm.with_structured_output(DissatisfiedConversationAnalysis)
-    result = DissatisfiedConversationAnalysis()
-
-    for session in state.sessions:
-        conversation = f"セッションID: {session.session_id}\n" + "\n".join(
-            f"{msg.role}: {msg.content}" for msg in session.messages
-        )
-        analysis = chain.invoke({"conversation": conversation})
-
-        # 会話ペアの追加
-        result.conversation_pairs.extend(analysis.conversation_pairs)
-
-        # 不満タイプの集計
-        result.dissatisfaction_types.response_length_issue += (
-            analysis.dissatisfaction_types.response_length_issue
-        )
-        result.dissatisfaction_types.complexity_issue += (
-            analysis.dissatisfaction_types.complexity_issue
-        )
-        result.dissatisfaction_types.intent_mismatch += (
-            analysis.dissatisfaction_types.intent_mismatch
-        )
-        result.dissatisfaction_types.ambiguous_answer += (
-            analysis.dissatisfaction_types.ambiguous_answer
-        )
-        result.dissatisfaction_types.impractical_answer += (
-            analysis.dissatisfaction_types.impractical_answer
-        )
-
-        # ユーザーパターンの集計
-        result.user_patterns.explicit_complaint += (
-            analysis.user_patterns.explicit_complaint
-        )
-        result.user_patterns.question_rephrasing += (
-            analysis.user_patterns.question_rephrasing
-        )
-        result.user_patterns.abrupt_termination += (
-            analysis.user_patterns.abrupt_termination
-        )
-        result.user_patterns.negative_short_response += (
-            analysis.user_patterns.negative_short_response
-        )
-        result.user_patterns.passive_reaction += analysis.user_patterns.passive_reaction
-
-        # 改善可能性の集計
-        result.improvement_possibilities.length_adjustment += (
-            analysis.improvement_possibilities.length_adjustment
-        )
-        result.improvement_possibilities.detail_adjustment += (
-            analysis.improvement_possibilities.detail_adjustment
-        )
-        result.improvement_possibilities.intent_confirmation += (
-            analysis.improvement_possibilities.intent_confirmation
-        )
-        result.improvement_possibilities.example_addition += (
-            analysis.improvement_possibilities.example_addition
-        )
-        result.improvement_possibilities.system_enhancement += (
-            analysis.improvement_possibilities.system_enhancement
-        )
-
-    return {"dissatisfied_conversation_analysis": result}
-
-
-def calculate_conversation_metrics(state: AnalysisState) -> Dict[str, Any]:
-    """会話の長さに関するメトリクスを計算"""
-    logger.info("会話長メトリクスの計算を開始します...")
-
-    metrics = ConversationLengthMetrics(
-        total_sessions=len(state.sessions), total_messages=len(state.messages)
-    )
-
-    for session in state.sessions:
-        turns = len(session.messages)
-
-        if turns <= 3:
-            metrics.distribution["1-3_turns"] += 1
-        elif turns <= 7:
-            metrics.distribution["4-7_turns"] += 1
-        elif turns <= 10:
-            metrics.distribution["8-10_turns"] += 1
-        elif turns <= 15:
-            metrics.distribution["11-15_turns"] += 1
-        else:
-            metrics.distribution["over_15_turns"] += 1
-
-    return {"conversation_length_metrics": metrics}
-
-
-def save_analysis_result(state: AnalysisState) -> None:
-    """分析結果をsummariesテーブルに保存"""
+    # データベースアダプターの初期化
     db = SupabaseAdapter()
 
-    # target_dateをISO形式に変換
-    iso_target_date = state.target_date.isoformat() if state.target_date else None
+    # 言語使用の分析
+    languages: Language = Language(languages={})
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # 同じtarget_dateのレコードを検索
-    existing_record = None
-    if iso_target_date:
-        existing_record = db.get_record_by_condition(
-            "summaries", "target_date", iso_target_date
+    # ユーザータイプの分析
+    new_users = 0
+    repeat_users = 0
+
+    # 指定された日付がある場合は使用し、なければ現在日付を使用
+    target_date = state.target_date or datetime.now(timezone.utc).date()
+
+    # 日本時間の00:00をUTCに変換
+    jst = timezone(timedelta(hours=9))
+    target_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=jst)
+    target_utc = target_dt.astimezone(timezone.utc)
+
+    for session in state.sessions:
+        # セッションIDに対応するpublic_chat_sessionsレコードを検索
+        chat_session = db.get_record_by_condition(
+            "public_chat_sessions", "id", session.session_id
         )
 
-    metrics = state.conversation_length_metrics
-    analyses = state.conversation_analyses
-    unknown = state.unknown_question_analysis
-    dissatisfied = state.dissatisfied_conversation_analysis
+        if chat_session:
+            # created_atをdatetimeオブジェクトに変換
+            session_created_at = parse_datetime(chat_session["created_at"])
 
-    data = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "target_date": iso_target_date,
-        "tweet": None,
-        "public_messages_test": {
-            "conversation_length_metrics": {
-                "total_sessions": metrics.total_sessions,
-                "total_messages": metrics.total_messages,
-                "distribution": metrics.distribution,
-            },
-            "conversation_analyses": analyses.model_dump(),
-            "unknown_question_analysis": unknown.model_dump(),
-            "dissatisfied_conversation_analysis": dissatisfied.model_dump(),
-            "target_date": iso_target_date,
-        },
-        "version": "2",
+            # 対象日より前に作成されたセッションがあればリピートユーザー
+            if session_created_at < target_utc:
+                repeat_users += 1
+            else:
+                new_users += 1
+        else:
+            # セッション情報が見つからない場合は新規ユーザーとして扱う
+            new_users += 1
+
+        # 言語分析の処理（既存のコード）
+        if not any(msg.role == "user" for msg in session.messages):
+            continue
+
+        conversation = get_conversation(session)
+        try:
+            result = llm.invoke(
+                f"""以下の会話テキストを分析し、ユーザー（role: user）が使用している
+                言語を判定してください。AIアシスタント（role: assistant）の発言は
+                文脈の参考として使用してください。
+
+                複数の言語が使用されている場合は、最も多く使用されている言語を
+                1つ選んでください。
+                回答は日本語で言語名のみを記載してください
+                （例：日本語、英語、ドイツ語、フランス語など）。
+
+                会話テキスト：
+                {conversation}
+                """
+            )
+
+            normalized_language = str(
+                result.content[0]
+                if isinstance(result.content, list)
+                else result.content
+            ).strip()
+
+            languages.languages[normalized_language] = (
+                languages.languages.get(normalized_language, 0) + 1
+            )
+
+        except Exception as e:
+            logger.error("言語判定中にエラーが発生: %s", e)
+            continue
+
+    total_users = new_users + repeat_users
+    repeat_rate = round((repeat_users / total_users * 100), 1) if total_users > 0 else 0
+    total_messages = sum(len(session.messages) for session in state.sessions)
+
+    user_metrics = {
+        "languages": languages,
+        "user_types": UserType(
+            new_user=new_users, repeat_user=repeat_users
+        ).model_dump(),
+        "repeat_rate": repeat_rate,
+        "total_users": total_users,
+        "total_messages": total_messages,
     }
 
-    if existing_record:
-        db.update_record("summaries", existing_record["id"], data)
-    else:
-        db.insert_record("summaries", data)
+    return {"user_metrics": user_metrics}
 
 
-class AITuberAnalyzer:
+def analyze_topics_node(state: AnalysisState) -> Dict[str, Any]:
+    """トピックの分析を行うノード"""
+    logger.info("トピック分析を開始します...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    # prompt = hub.pull("tegnike/aituberkit_topics")
+    prompt = PromptTemplate.from_template("""あなたは会話分析の専門家です。与えられた会話を分析し、トピックを適切なカテゴリーに分類してください。
+
+以下のカテゴリーに基づいて分類してください：
+- technical: 技術・開発関連（プログラミング、環境構築、技術的な質問など）
+- education: 教育・学習関連（言語学習、文化、教育コンテンツなど）
+- hobby: 趣味・エンターテイメント関連（趣味の話題、日常会話など）
+- business: ビジネス関連（ビジネスの話題、ビジネスの質問など）
+- lifestyle: 生活・健康関連（生活相談、健康、ペットなど）
+- system: システム関連（この会話システム「AITuberKit」の機能の質問、バグ報告、改善要望など）
+- other: その他（上記カテゴリーに分類できない話題, 挨拶、日常会話など）
+
+各カテゴリーについて、以下の情報を提供してください：
+1. topic: 具体的な話題（例：「プログラミング質問」「日本語学習」など）
+2. count: 必ず1を返してください
+
+会話テキスト:
+{conversation}
+
+応答は以下の形式で返してください：
+{{
+    "technical": [
+        {{
+            "count": 1,
+            "topic": "トピック名"
+        }},
+        ...
+    ],
+    "education": [...],
+    "hobby": [...],
+    "business": [...],
+    "lifestyle": [...],
+    "system": [...],
+    "other": [...]
+}}
+
+注意事項：
+- 1つの会話から複数のトピックを抽出可能です
+- 各カテゴリーは空配列でも構いません
+- トピック名は具体的かつ簡潔にしてください
+- 分類が曖昧な場合は、最も適切なカテゴリーを1つ選んでください""")
+
+    chain = prompt | llm.with_structured_output(TopicMetrics)
+
+    topic_metrics = TopicMetrics()
+    for session in state.sessions:
+        conversation = get_conversation(session)
+        try:
+            session_topics = chain.invoke({"conversation": conversation})
+            # 各カテゴリーのトピックをマージ
+            for category in TOPICS_CATEGORY.keys():
+                current_topics = getattr(topic_metrics, category)
+                new_topics = getattr(session_topics, category)
+                for new_topic in new_topics:
+                    # 既存のトピックの更新または新規追加
+                    found = False
+                    for existing in current_topics:
+                        if existing.topic == new_topic.topic:
+                            existing.count += new_topic.count
+                            found = True
+                            break
+                    if not found:
+                        current_topics.append(new_topic)
+        except Exception as e:
+            logger.error("トピック分析中にエラーが発生: %s", e)
+
+    return {"topic_metrics": topic_metrics.model_dump()}
+
+
+def analyze_conversation_metrics_node(
+    state: AnalysisState,
+) -> Dict[str, Any]:
+    """会話メトリクスの分析を行うノード"""
+    logger.info("会話メトリクス分析を開始します...")
+
+    time_dist = {time: {"count": 0, "total_turns": 0} for time in TIME_CATEGORY}
+    turn_dist = {turn: 0 for turn in TURN_CATEGORY}
+
+    for session in state.sessions:
+        if not session.messages:
+            continue
+
+        conversation = get_conversation(session)
+
+        ## ここでAIを使用して会話の言語が何か、タイムゾーンはどこか、日本と比較してプラスマイナス何時間かを取得する
+        llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        prompt = PromptTemplate.from_template("""以下の会話テキストを分析し、会話の言語、タイムゾーン、日本と比較したときの時刻がプラスマイナス何時間かを取得してください。
+日本の場合はオフセットは0時間です。
+
+会話テキスト:
+{conversation}
+
+応答は以下の形式で返してください：
+{{
+    "language": "言語名",
+    "timezone": "タイムゾーン名",
+    "offset": "プラスマイナス何時間か"
+}}
+
+例：
+{{
+    "language": "英語",
+    "timezone": "アメリカ",
+    "offset": 13
+}}
+""")
+        chain = prompt | llm.with_structured_output(LanguageMetrics)
+        language_metrics: LanguageMetrics = chain.invoke({"conversation": conversation})
+        offset: int = language_metrics.offset
+
+        # 時間帯の分析（最初のメッセージの作成時間を使用）
+        hour = session.messages[0].created_at.hour + offset
+        time_slot = None
+        if 0 <= hour < 4:
+            time_slot = "morning"
+        elif 4 <= hour < 8:
+            time_slot = "afternoon"
+        elif 8 <= hour < 12:
+            time_slot = "evening"
+        elif 12 <= hour < 16:
+            time_slot = "night"
+        elif 16 <= hour < 20:
+            time_slot = "late_night"
+        else:
+            time_slot = "midnight"
+
+        turns = len(session.messages) / 2
+        time_dist[time_slot]["count"] += 1
+        time_dist[time_slot]["total_turns"] += turns
+
+        # ターン数の分布
+        if turns <= 3:
+            turn_dist["1-3_turns"] += 1
+        elif turns <= 7:
+            turn_dist["4-7_turns"] += 1
+        elif turns <= 10:
+            turn_dist["8-10_turns"] += 1
+        elif turns <= 15:
+            turn_dist["11-15_turns"] += 1
+        else:
+            turn_dist["over_15_turns"] += 1
+
+    # 平均ターン数の計算
+    time_distribution = {}
+    for time_slot, data in time_dist.items():
+        if data["count"] > 0:
+            avg_turns = data["total_turns"] / data["count"]
+        else:
+            avg_turns = 0
+        time_distribution[time_slot] = TimeDistribution(
+            count=data["count"],
+            avg_turns=avg_turns,
+        )
+
+    conversation_metrics = ConversationMetrics(
+        time_distribution=time_distribution,
+        turn_distribution=turn_dist,
+    )
+
+    return {"conversation_metrics": conversation_metrics}
+
+
+def analyze_issues_node(state: AnalysisState) -> Dict[str, Any]:
+    """問題カテゴリーの分類と集計を行うノード"""
+    logger.info("問題分析を開始します...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    # prompt = hub.pull("tegnike/aituberkit_issues")
+    prompt = PromptTemplate.from_template("""あなたは会話分析の専門家です。与えられた会話を分析し、AIアシスタントの応答における問題点や制限を特定してください。
+
+以下のカテゴリーに基づいて分類してください：
+- feature_limitations: 機能の制限（技術的な制限、知識の制限など）
+- conversation_quality: 会話の質（説明の不十分さ、理解の不正確さなど）
+- usability: 操作性（使いにくさ、インターフェースの問題など）
+- response_quality: 応答品質（不適切な応答、誤った情報など）
+- user_experience: ユーザー体験（文脈の維持、対話の一貫性など）
+
+各問題について以下の情報を提供してください：
+1. category: 上記のカテゴリーから最も適切なもの
+2. description: 具体的にどのような問題が発生したか、やり取りを意訳して記載してください
+3. solution: その問題に対する実践的な解決策や改善方法
+
+会話テキスト:
+{conversation}
+
+応答は以下の形式のリストで返してください：
+[
+    {{
+        "category": "カテゴリー名",
+        "description": "問題の詳細な説明",
+        "solution": "具体的な解決策"
+    }},
+    ...
+]
+
+注意事項：
+- 1つの会話から複数の問題を抽出可能です
+- 明確な問題が見られない場合は空のリストを返してください
+- 問題の深刻度に関係なく、改善の余地がある点を具体的に指摘してください
+- 解決策は実践的で具体的なものを提案してください
+""")
+
+    chain = prompt | llm.with_structured_output(IssueList)
+
+    issues: List[Issue] = []
+    for session in state.sessions:
+        conversation = get_conversation(session)
+        try:
+            result = chain.invoke({"conversation": conversation})
+            issues.extend(result.issues)
+        except Exception as e:
+            logger.error("問題分析中にエラーが発生: %s", e)
+
+    return {"issues": issues}
+
+
+def summarize_issues_node(state: AnalysisState) -> Dict[str, Any]:
+    """問題の要約を行うノード"""
+    logger.info("問題の要約を開始します...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    summarize_prompt = PromptTemplate.from_template("""あなたは会話分析の専門家です。複数の問題報告を分析し、重要と考えられるものの選択及び類似問題の統合を行ってください。
+
+この会話はwebアプリにおけるユーザとAIキャラとの会話です。
+今回のカテゴリは{category}です。
+
+入力された問題リストを以下の基準で整理してください：
+- 類似の問題は統合する。具体的に類似度が8割と考えられた場合に限る。
+- 統合した結果、複数の解決策がある場合は、最も効果的なものを選択または組み合わせる
+- 説明は具体的かつ簡潔にまとめるが、抽象的にならないようにする
+- まとめる必要がない課題はそのまま返す
+- 各課題の重要度を考慮し、優先度順に並び替える
+- 優先度順に最大5つまでを返す
+
+問題リスト:
+{issues}
+
+以下の形式で最大5つまで返してください：
+[
+    {{
+        "category": "{category}",
+        "description": "統合された問題の説明",
+        "solution": "最適化された解決策"
+    }},
+    ...
+]
+
+注意事項：
+- 少しでも異なると考えられる問題は別々に維持してください
+- 最終的なリストは元のリストより少ない項目数になるはずです（最大5つ）
+""")
+    summarize_chain = summarize_prompt | llm.with_structured_output(IssueList)
+
+    category_issues = {}
+    for issue in state.issues:
+        if issue.category not in category_issues:
+            category_issues[issue.category] = []
+        category_issues[issue.category].append(issue)
+
+    # 問題の要約を実行
+    summarized_issues: List[Issue] = []
+    try:
+        for category, category_specific_issues in category_issues.items():
+            result = summarize_chain.invoke(
+                {"category": category, "issues": category_specific_issues}
+            )
+            # リストを結合する
+            summarized_issues.extend(result.issues[:5])
+    except Exception as e:
+        logger.error("問題の要約中にエラーが発生: %s", e)
+
+    return {"issues": summarized_issues}
+
+
+def get_conversation(session: Session) -> str:
+    """セッションの会話を文字列に変換"""
+    return "\n".join(f"{msg.role}: {msg.content}" for msg in session.messages)
+
+
+class AITuberAnalyzer2:
     def __init__(self, target_date: str | None = None):
         self.workflow = StateGraph(AnalysisState)
         self.target_date = (
@@ -500,36 +615,50 @@ class AITuberAnalyzer:
     def _build_graph(self):
         # ノードの追加
         self.workflow.add_node("fetch_data", fetch_data_node)
-        self.workflow.add_node("organize_sessions", organize_sessions_node)
-        self.workflow.add_node("calculate_metrics", calculate_conversation_metrics)
+        self.workflow.add_node(
+            "organize_sessions",
+            organize_sessions_node,
+        )
 
         # 分析ノードを個別に追加
-        self.workflow.add_node("analyze_conversations", analyze_conversations)
-        self.workflow.add_node("analyze_unknown_questions", analyze_unknown_questions)
         self.workflow.add_node(
-            "analyze_dissatisfied_conversations", analyze_dissatisfied_conversations
+            "analyze_user_metrics",
+            analyze_user_metrics_node,
         )
+        self.workflow.add_node("analyze_topics", analyze_topics_node)
+        self.workflow.add_node(
+            "analyze_conversation_metrics",
+            analyze_conversation_metrics_node,
+        )
+        self.workflow.add_node("analyze_issues", analyze_issues_node)
+        self.workflow.add_node("summarize_issues", summarize_issues_node)
 
         # エントリーポイントの設定
         self.workflow.set_entry_point("fetch_data")
 
         # エッジの追加
         self.workflow.add_edge("fetch_data", "organize_sessions")
-        self.workflow.add_edge("organize_sessions", "calculate_metrics")
 
         # 並列実行のためのエッジを追加
-        self.workflow.add_edge("calculate_metrics", "analyze_conversations")
-        self.workflow.add_edge("calculate_metrics", "analyze_unknown_questions")
         self.workflow.add_edge(
-            "calculate_metrics", "analyze_dissatisfied_conversations"
+            "organize_sessions",
+            "analyze_user_metrics",
         )
+        self.workflow.add_edge("organize_sessions", "analyze_topics")
+        self.workflow.add_edge(
+            "organize_sessions",
+            "analyze_conversation_metrics",
+        )
+        self.workflow.add_edge("organize_sessions", "analyze_issues")
+        self.workflow.add_edge("analyze_issues", "summarize_issues")
 
         # 並列処理の結果を終了ポイントに接続
         self.workflow.add_edge(
             [
-                "analyze_conversations",
-                "analyze_unknown_questions",
-                "analyze_dissatisfied_conversations",
+                "analyze_user_metrics",
+                "analyze_topics",
+                "analyze_conversation_metrics",
+                "summarize_issues",
             ],
             END,
         )
@@ -544,17 +673,56 @@ class AITuberAnalyzer:
         # 分析結果を保存
         save_analysis_result(final_state)
 
-        metrics = final_state.conversation_length_metrics
-        analyses = final_state.conversation_analyses
-        unknown = final_state.unknown_question_analysis
-        dissatisfied = final_state.dissatisfied_conversation_analysis
-
         return {
-            "conversation_length_metrics": metrics.model_dump(),
-            "conversation_analyses": analyses.model_dump(),
-            "unknown_question_analysis": unknown.model_dump(),
-            "dissatisfied_conversation_analysis": dissatisfied.model_dump(),
+            "issues": final_state.issues,
+            "user_metrics": final_state.user_metrics,
+            "topic_metrics": final_state.topic_metrics,
+            "conversation_metrics": final_state.conversation_metrics,
         }
+
+
+def save_analysis_result(state: AnalysisState) -> None:
+    """分析結果をsummariesテーブルに保存"""
+    db = SupabaseAdapter()
+
+    # target_dateをISO形式に変換
+    iso_target_date = state.target_date.isoformat() if state.target_date else None
+
+    # 同じtarget_dateのレコードを検索
+    existing_record = None
+    if iso_target_date:
+        existing_record = db.get_record_by_condition(
+            "summaries",
+            "target_date",
+            iso_target_date,
+        )
+
+    data = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "target_date": iso_target_date,
+        "tweet": None,
+        "public_message": {
+            "issues": [issue.model_dump() for issue in state.issues],
+            "user_metrics": (
+                state.user_metrics.model_dump() if state.user_metrics else None
+            ),
+            "topic_metrics": (
+                state.topic_metrics.model_dump() if state.topic_metrics else None
+            ),
+            "conversation_metrics": (
+                state.conversation_metrics.model_dump()
+                if state.conversation_metrics
+                else None
+            ),
+            "target_date": iso_target_date,
+        },
+        "version": "3",
+    }
+
+    if existing_record:
+        db.update_record("summaries", existing_record["id"], data)
+    else:
+        db.insert_record("summaries", data)
 
 
 def main():
@@ -564,7 +732,7 @@ def main():
     parser.add_argument("--date", help="分析対象日 (YYYY-MM-DD形式)")
 
     args = parser.parse_args()
-    analyzer = AITuberAnalyzer(target_date=args.date)
+    analyzer = AITuberAnalyzer2(target_date=args.date)
     result = analyzer.run()
     logger.info(f"Analysis Report:\n{result}")
 
