@@ -526,7 +526,8 @@ def analyze_issues_node(state: AnalysisState) -> Dict[str, Any]:
 - 明確な問題が見られない場合は空のリストを返してください
 - 問題の深刻度に関係なく、改善の余地がある点を具体的に指摘してください
 - 解決策は実践的で具体的なものを提案してください
-""")
+- ユーザの回答に日時が含まれていたり、AIの回答に感情タグ[neutral|happy|sad]が含まれてる場合がありますが、それらは正常なので無視してください
+- キャラアプリという特性上、AIの返信に対して、ユーザが反応しない場合が多いです。そのため、AIの返信で終わっている事象は問題として判断しないでください""")
 
     chain = prompt | llm.with_structured_output(IssueList)
 
@@ -575,7 +576,8 @@ def summarize_issues_node(state: AnalysisState) -> Dict[str, Any]:
 注意事項：
 - 少しでも異なると考えられる問題は別々に維持してください
 - 最終的なリストは元のリストより少ない項目数になるはずです（最大5つ）
-""")
+- ユーザの回答に日時が含まれていたり、AIの回答に感情タグ[neutral|happy|sad]が含まれてる場合がありますが、それらは正常なので無視してください
+- キャラアプリという特性上、AIの返信に対して、ユーザが反応しない場合が多いです。そのため、AIの返信で終わっている事象は問題として判断しないでください""")
     summarize_chain = summarize_prompt | llm.with_structured_output(IssueList)
 
     category_issues = {}
