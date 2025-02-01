@@ -699,6 +699,13 @@ def save_analysis_result(state: AnalysisState) -> None:
             iso_target_date,
         )
 
+    # ユーザーメトリクスから値を取得
+    total_users = state.user_metrics.total_users if state.user_metrics else 0
+    total_messages = state.user_metrics.total_messages if state.user_metrics else 0
+    repeat_users = (
+        state.user_metrics.user_types.repeat_user if state.user_metrics else 0
+    )
+
     data = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target_date": iso_target_date,
@@ -719,6 +726,9 @@ def save_analysis_result(state: AnalysisState) -> None:
             "target_date": iso_target_date,
         },
         "version": "3",
+        "public_chat_session_count": total_users,
+        "public_message_count": total_messages,
+        "repeat_count": repeat_users,
     }
 
     if existing_record:
