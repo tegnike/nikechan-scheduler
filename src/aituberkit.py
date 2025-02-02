@@ -684,7 +684,7 @@ class AITuberAnalyzer2:
 
 
 def save_analysis_result(state: AnalysisState) -> None:
-    """分析結果をsummariesテーブルに保存"""
+    """分析結果をdaily_summariesテーブルに保存"""
     db = SupabaseAdapter()
 
     # target_dateをISO形式に変換
@@ -694,7 +694,7 @@ def save_analysis_result(state: AnalysisState) -> None:
     existing_record = None
     if iso_target_date:
         existing_record = db.get_record_by_condition(
-            "summaries",
+            "daily_summaries",
             "target_date",
             iso_target_date,
         )
@@ -732,9 +732,9 @@ def save_analysis_result(state: AnalysisState) -> None:
     }
 
     if existing_record:
-        db.update_record("summaries", existing_record["id"], data)
+        db.update_record("daily_summaries", existing_record["id"], data)
     else:
-        db.insert_record("summaries", data)
+        db.insert_record("daily_summaries", data)
 
 
 def main():
