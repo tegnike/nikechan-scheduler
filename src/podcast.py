@@ -7,8 +7,11 @@ import requests
 from pydub import AudioSegment
 
 # 英語から日本語読みへの変換辞書を読み込む
-with open("src/englishToJapanese.json", "r", encoding="utf-8") as f:
+with open("src/resources/englishToJapanese.json", "r", encoding="utf-8") as f:
     english_to_japanese = json.load(f)
+
+# 出力ディレクトリの作成
+os.makedirs("output", exist_ok=True)
 
 
 def convert_english_to_japanese(text):
@@ -93,7 +96,7 @@ def combine_audio_files(audio_files, output_file):
             combined += audio + silence
 
     # BGMを読み込み、音量を30%に調整
-    bgm = AudioSegment.from_mp3("src/2_23_AM_2.mp3")
+    bgm = AudioSegment.from_mp3("src/resources/2_23_AM_2.mp3")
     bgm = bgm - 20
 
     # BGMの長さを合わせる
@@ -136,7 +139,7 @@ def create_podcast():
 
     # 音声ファイルを結合
     print("Combining audio files...")
-    combine_audio_files(audio_files, "final_podcast.wav")
+    combine_audio_files(audio_files, "output/final_podcast.wav")
 
     # 一時ファイルを削除
     for file in audio_files:
@@ -144,7 +147,7 @@ def create_podcast():
             os.remove(file)
     os.rmdir("temp_audio")
 
-    print("Audio generation completed: final_podcast.wav")
+    print("Audio generation completed: output/final_podcast.wav")
 
 
 if __name__ == "__main__":
