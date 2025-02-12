@@ -119,6 +119,36 @@ class SupabaseAdapter:
             print(f"Error fetching record by condition: {e}")
             return None
 
+    def upload_to_storage(self, bucket: str, path: str, data: bytes) -> bool:
+        """Supabase Storageにファイルをアップロード
+
+        Args:
+            bucket (str): バケット名
+            path (str): ファイルパス
+            data (bytes): アップロードするバイナリデータ
+
+        Returns:
+            bool: アップロード成功時はTrue、失敗時はFalse
+        """
+        try:
+            self.client.storage.from_(bucket).upload(path, data)
+            return True
+        except Exception as e:
+            print(f"Error uploading file to storage: {e}")
+            return False
+
+    def get_storage_public_url(self, bucket: str, path: str) -> str:
+        """Supabase StorageのファイルのURLを取得
+
+        Args:
+            bucket (str): バケット名
+            path (str): ファイルパス
+
+        Returns:
+            str: ファイルの公開URL
+        """
+        return self.client.storage.from_(bucket).get_public_url(path)
+
 
 # テスト実行用コード
 if __name__ == "__main__":

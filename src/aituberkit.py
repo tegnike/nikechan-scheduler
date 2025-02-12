@@ -1,13 +1,19 @@
+import json
 import logging
+import os
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
+import requests
 from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+from pydub import AudioSegment
 
 from supabase_adapter import SupabaseAdapter
 
@@ -136,6 +142,10 @@ class Session:
     messages: List[Message]
 
 
+class PodcastText(BaseModel):
+    text: str
+
+
 class AnalysisState(BaseModel):
     # モデルの設定
     model_config = {"arbitrary_types_allowed": True}
@@ -151,6 +161,9 @@ class AnalysisState(BaseModel):
     conversation_metrics: Optional[ConversationMetrics] = None
 
     target_date: date | None = Field(default=None)
+
+    podcast_text: str | None = Field(default=None)
+    podcast_audio: bytes | None = Field(default=None)
 
 
 def parse_datetime(dt_str: str) -> datetime:
@@ -169,6 +182,103 @@ def parse_datetime(dt_str: str) -> datetime:
                 ms = ms_timezone[0].ljust(6, "0")
                 return datetime.fromisoformat(f"{main_part}.{ms}-{ms_timezone[1]}")
         return datetime.fromisoformat(dt_str)
+
+
+def get_conversation(session: Session) -> str:
+    """セッションの会話を文字列に変換"""
+    return "\n".join(f"{msg.role}: {msg.content}" for msg in session.messages)
+
+
+def convert_english_to_japanese(text: str) -> str:
+    """英語の表現を日本語の読みに変換する"""
+    with open("src/resources/englishToJapanese.json", "r", encoding="utf-8") as f:
+        english_to_japanese = json.load(f)
+
+    result = text
+
+    # 長い表現から順に変換を行う（部分一致の問題を防ぐため）
+    for eng, jpn in sorted(
+        english_to_japanese.items(), key=lambda x: len(x[0]), reverse=True
+    ):
+        # 大文字小文字を区別せずに置換
+        pattern = eng.lower()
+        # テキスト全体を小文字に変換して検索し、見つかった場合は元のテキストの該当部分を置換
+        text_lower = result.lower()
+        start = 0
+        while True:
+            index = text_lower.find(pattern, start)
+            if index == -1:
+                break
+            # 元のテキストの該当部分を置換
+            result = result[:index] + jpn + result[index + len(pattern) :]
+            # 次の検索開始位置を更新
+            text_lower = result.lower()
+            start = index + len(jpn)
+
+    return result
+
+
+def synthesize_voice(text: str, output_file: str) -> bool:
+    """音声合成APIを呼び出して音声ファイルを生成する"""
+    url = "https://ab269viny4ztmt-5000.proxy.runpod.net/voice"
+
+    params = {
+        "text": text,
+        "model_id": "10",
+        "sdp_ratio": "0.8",
+        "noise": "0.6",
+        "noisew": "0.8",
+        "length": "1.1",
+        "language": "JP",
+        "auto_split": "true",
+        "split_interval": "0.5",
+        "assist_text_weight": "1",
+        "style": "Neutral",
+        "style_weight": "1",
+    }
+
+    headers = {"accept": "audio/wav", "X-API-TOKEN": "3627533934632785"}
+
+    # URLエンコードされたパラメータを含むURLを構築
+    query = "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
+    full_url = f"{url}?{query}"
+
+    response = requests.get(full_url, headers=headers)
+
+    if response.status_code == 200:
+        with open(output_file, "wb") as f:
+            f.write(response.content)
+        return True
+    return False
+
+
+def combine_audio_files(audio_files: List[str], output_file: str) -> None:
+    """音声ファイルを結合する"""
+    combined = AudioSegment.empty()
+    silence = AudioSegment.silent(duration=500)  # 0.5秒の無音
+
+    # 音声ファイルを結合
+    for audio_file in audio_files:
+        if os.path.exists(audio_file):
+            audio = AudioSegment.from_wav(audio_file)
+            combined += audio + silence
+
+    # BGMを読み込み、音量を30%に調整
+    bgm = AudioSegment.from_mp3("src/resources/2_23_AM_2.mp3")
+    bgm = bgm - 20
+
+    # BGMの長さを合わせる
+    if len(bgm) < len(combined):
+        # BGMが短い場合は繰り返し
+        repeats = (len(combined) // len(bgm)) + 1
+        bgm = bgm * repeats
+
+    # BGMを合成音声の長さに合わせてトリミング
+    bgm = bgm[: len(combined)]
+
+    # BGMと合成音声をミックス
+    final_audio = combined.overlay(bgm)
+    final_audio.export(output_file, format="wav")
 
 
 def fetch_data_node(state: AnalysisState) -> Dict[str, Any]:
@@ -601,9 +711,161 @@ def summarize_issues_node(state: AnalysisState) -> Dict[str, Any]:
     return {"issues": summarized_issues}
 
 
-def get_conversation(session: Session) -> str:
-    """セッションの会話を文字列に変換"""
-    return "\n".join(f"{msg.role}: {msg.content}" for msg in session.messages)
+def create_podcast_text_node(state: AnalysisState) -> Dict[str, Any]:
+    """ポッドキャストのテキストを作成するノード"""
+    logger.info("ポッドキャストのテキスト作成を開始します...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    summarize_prompt = PromptTemplate.from_template("""
+あなたは、AITuberKitのAIキャラ「ニケ」です。あなたの役割は、提供された1日の会話データを基に、ポッドキャスト向けの会話要約スクリプトを作成することです。
+
+## 指示内容
+以下のJSONデータを分析し、ポッドキャストで話すのに適した口調で、1日分の会話を振り返るスクリプトを作成してください。出力は、ニケが語り手となり、ユーザーが自然に聞き取れる流れで構成してください。
+
+## 出力要件
+- **会話の流れを意識して、スムーズに繋がる文章を作成すること**
+- **文章はポッドキャスト向けの話し言葉とし、自然に聞こえる口調にする**
+- **キャラとしての一貫性を守り、AIキャラ「ニケ」の視点で語る**
+- **アプリ名「AITuberKit」を必ず明記する**
+- **ユーザーが関心を持ちそうな主要トピックをピックアップし、要点を整理して説明する**
+- **空の行を使わず、自然なリズムで繋げる**
+- **「今日のムードは？」のような人工的なフレーズを避け、スムーズな流れを作る**
+- **「！」は適度に使用して抑揚をつけるが、過剰に使わない**
+- **絵文字は使用しない**
+- **全体で約2分の長さ（400〜600文字程度）にまとめる**
+
+## 出力フォーマット
+ポッドキャストの流れを意識し、以下のような構成で作成してください。
+
+1. **導入（挨拶と概要）**  
+   - 「こんにちは、ニケです。今日もAITuberKitでの会話を振り返ります！」など、自然な入り方をする
+   - その日の会話の全体的な傾向を軽く触れる（例：「今日は技術の話が多めでした。」）
+
+2. **主要トピックの紹介**  
+   - JSONデータの **"topic_metrics"** を分析し、最も頻出したトピックや、特徴的な話題を3〜4つ選び紹介
+   - 技術、趣味、ライフスタイル、ビジネスなど、幅広いジャンルを考慮
+   - 例：「技術関連では、AIとMinecraftの統合についての議論が活発でした。」
+
+3. **話題ごとの掘り下げ**  
+   - 選ばれたトピックの中から、特に印象的なものを少し詳しく説明
+   - 例：「また、アニメ映画『君の名は。』の感想を語るユーザーもいました。」
+
+4. **会話の質や改善点の振り返り**  
+   - JSONの **"issues"** の中から、特にユーザー体験に影響を与えた改善点を1〜2つ取り上げる
+   - 例：「ユーザーが英語で会話を希望しているのに、日本語で返してしまう場面がありました。」
+
+5. **会話のピーク時間について**  
+   - JSONの **"conversation_metrics"** を確認し、どの時間帯に会話が活発だったか触れる
+   - 例：「今日は深夜の時間帯に会話が盛り上がりました。」
+
+6. **締めの挨拶**  
+   - 「それでは、また次の会話でお会いしましょう！」など、ポッドキャストらしい締め方をする
+
+## JSONデータ
+以下のデータをもとに、上記の要件を満たすポッドキャストスクリプトを作成してください。
+
+```json
+{json_data}
+```
+
+## 出力例
+こんにちは、ニケです。
+今日もAITuberKitでの会話を振り返ります！
+今日は技術や趣味の話が多く、特にAIとゲームの組み合わせに関する興味が目立ちました。
+技術関連では「AIとMinecraftの統合」や「NVIDIAの株価」についての話題があり、最新技術の動向についての関心が高まっているようです。
+一方、趣味の話では「ヨガやダンス」「ボードゲーム」「旅行計画」といった幅広いテーマが登場しました。
+特に、「絵を描く」や「粘土細工」のような創作系の話題が印象的でした。
+AITuberKitの会話の質を振り返ると、いくつかの課題が見えてきました。
+たとえば、ユーザーが英語で会話を希望しているのに、日本語で返してしまう場面があったり、私の名前について異なる回答をしてしまうことがありました。
+よりスムーズな会話のために、改善が必要ですね。今日は特に深夜の時間帯に会話が活発で、リラックスした雑談や感情表現に関する質問が多くありました。
+今後も、より自然で快適な会話ができるように改良していきます！
+それでは、また次の会話でお会いしましょう！
+""")
+    podcast_text_chain = summarize_prompt | llm.with_structured_output(PodcastText)
+    podcast_text = podcast_text_chain.invoke(
+        {
+            "json_data": {
+                "issues": state.issues,
+                "user_metrics": state.user_metrics,
+                "topic_metrics": state.topic_metrics,
+                "conversation_metrics": state.conversation_metrics,
+            }
+        }
+    )
+
+    return {"podcast_text": podcast_text.text}
+
+
+def create_podcast_audio_node(state: AnalysisState) -> Dict[str, Any]:
+    """ポッドキャストを作成するノード"""
+    logger.info("ポッドキャスト作成を開始します...")
+
+    # 一時ファイルを保存するディレクトリを作成
+    os.makedirs("temp_audio", exist_ok=True)
+
+    # 定型文のサマリー
+    summary = state.podcast_text
+
+    # 行ごとに分割
+    lines = [line.strip() for line in summary.split("\n") if line.strip()]
+    audio_files = []
+
+    # 各行を音声合成
+    for i, line in enumerate(lines):
+        output_file = f"temp_audio/audio_{i}.wav"
+        audio_files.append(output_file)
+
+        # 英語を日本語読みに変換
+        converted_line = convert_english_to_japanese(line)
+
+        logger.info(f"Synthesizing line {i + 1}/{len(lines)}")
+        if synthesize_voice(converted_line, output_file):
+            logger.info(f"Successfully generated {output_file}")
+            time.sleep(1)  # APIの負荷を考慮して1秒待機
+        else:
+            logger.error(f"Failed to generate audio for line: {converted_line}")
+
+    # 音声ファイルを結合してバイナリデータとして保持
+    logger.info("Combining audio files...")
+    combined = AudioSegment.empty()
+    silence = AudioSegment.silent(duration=500)  # 0.5秒の無音
+
+    # 音声ファイルを結合
+    for audio_file in audio_files:
+        if os.path.exists(audio_file):
+            audio = AudioSegment.from_wav(audio_file)
+            combined += audio + silence
+
+    # BGMを読み込み、音量を30%に調整
+    bgm = AudioSegment.from_mp3("src/resources/2_23_AM_2.mp3")
+    bgm = bgm - 20
+
+    # BGMの長さを合わせる
+    if len(bgm) < len(combined):
+        # BGMが短い場合は繰り返し
+        repeats = (len(combined) // len(bgm)) + 1
+        bgm = bgm * repeats
+
+    # BGMを合成音声の長さに合わせてトリミング
+    bgm = bgm[: len(combined)]
+
+    # BGMと合成音声をミックス
+    final_audio = combined.overlay(bgm)
+
+    # バイナリデータに変換
+    import io
+
+    audio_data = io.BytesIO()
+    final_audio.export(audio_data, format="wav")
+    audio_binary = audio_data.getvalue()
+
+    # 一時ファイルを削除
+    for file in audio_files:
+        if os.path.exists(file):
+            os.remove(file)
+    os.rmdir("temp_audio")
+
+    logger.info("Audio generation completed")
+    return {"podcast_audio": audio_binary}
 
 
 class AITuberAnalyzer2:
@@ -634,6 +896,8 @@ class AITuberAnalyzer2:
         )
         self.workflow.add_node("analyze_issues", analyze_issues_node)
         self.workflow.add_node("summarize_issues", summarize_issues_node)
+        self.workflow.add_node("create_podcast_text", create_podcast_text_node)
+        self.workflow.add_node("create_podcast_audio", create_podcast_audio_node)
 
         # エントリーポイントの設定
         self.workflow.set_entry_point("fetch_data")
@@ -662,8 +926,11 @@ class AITuberAnalyzer2:
                 "analyze_conversation_metrics",
                 "summarize_issues",
             ],
-            END,
+            "create_podcast_text",
         )
+
+        self.workflow.add_edge("create_podcast_text", "create_podcast_audio")
+        self.workflow.add_edge("create_podcast_audio", END)
 
     def run(self) -> Dict[str, Any]:
         """分析を実行し、結果を返す"""
@@ -706,6 +973,18 @@ def save_analysis_result(state: AnalysisState) -> None:
         state.user_metrics.user_types.repeat_user if state.user_metrics else 0
     )
 
+    # ポッドキャストの音声データをStorageに保存
+    storage_url = None
+    if state.podcast_audio:
+        storage_path = (
+            f"{iso_target_date}.wav"
+            if iso_target_date
+            else f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.wav"
+        )
+        db.upload_to_storage("summary_podcast", storage_path, state.podcast_audio)
+        storage_url = db.get_storage_public_url("summary_podcast", storage_path)
+        logger.info(f"Successfully uploaded podcast to {storage_path}")
+
     data = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target_date": iso_target_date,
@@ -729,6 +1008,8 @@ def save_analysis_result(state: AnalysisState) -> None:
         "public_chat_session_count": total_users,
         "public_message_count": total_messages,
         "repeat_count": repeat_users,
+        "podcast": state.podcast_text,
+        "podcast_url": storage_url,
     }
 
     if existing_record:
