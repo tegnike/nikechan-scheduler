@@ -1,9 +1,11 @@
-import json
 import logging
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from langchain.schema import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from supabase_adapter import SupabaseAdapter
@@ -13,9 +15,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-# OpenAIクライアントの初期化
-client = OpenAI()
 
 
 class TweetSourceJudgeResult(BaseModel):
@@ -27,7 +26,11 @@ class TweetGenerationResult(BaseModel):
     tweet_text: str = Field(description="生成されたツイート")
 
 
-class TweetData(BaseModel):
+class TweetGenerationState(BaseModel):
+    # モデルの設定
+    model_config = {"arbitrary_types_allowed": True}
+
+    # データ取得関連
     conversation_history: List[Dict[str, Any]] = Field(
         default_factory=list, description="対話履歴"
     )
@@ -38,9 +41,21 @@ class TweetData(BaseModel):
         default_factory=list, description="マスターのツイート履歴"
     )
 
+    # 生成関連
+    judge_result: TweetSourceJudgeResult = Field(
+        default_factory=TweetSourceJudgeResult, description="ツイート生成元の判断結果"
+    )
+    pre_generated_tweet: str = Field(
+        default="", description="1次生成されたツイート（磨き前）"
+    )
+    generated_tweet: str = Field(default="", description="生成されたツイート")
+    is_tweet_polished: bool = Field(
+        default=False, description="ツイートが磨きをかけられたかどうか"
+    )
 
-def fetch_data() -> TweetData:
-    """Supabaseからデータを取得する"""
+
+def fetch_data_node(state: TweetGenerationState) -> Dict[str, Any]:
+    """Supabaseからデータを取得するノード"""
     logger.info("データ取得を開始します...")
 
     db = SupabaseAdapter()
@@ -77,24 +92,21 @@ def fetch_data() -> TweetData:
             }
         )
 
-    return TweetData(
-        conversation_history=conversation,
-        tweet_history=tweet_history,
-        master_tweet_history=master_tweets,
-    )
+    return {
+        "conversation_history": conversation,
+        "tweet_history": tweet_history,
+        "master_tweet_history": master_tweets,
+    }
 
 
-def judge_content(data: TweetData) -> TweetSourceJudgeResult:
-    """ツイート生成元（会話履歴かマスターのツイート）を判断する"""
+def judge_content_node(state: TweetGenerationState) -> Dict[str, Any]:
+    """ツイート生成元（会話履歴かマスターのツイート）を判断するノード"""
     logger.info("ツイート生成元の判断を開始します...")
-
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     prompt = f"""
 あなたはニケ、ベテランツイッタラーです。
-これから「女子高生AIのニケ（assistant）」と「マスター（user）」との1日の対話テストの内容 
-および マスターのツイート歴 および 過去のニケのツイート歴を共有します。
-それらの情報から、AIのニケがツイートを作成するので、あなたは「対話テストの内容」か
-「マスターのツイート歴」のどちらが面白い内容を作れるかを考えてください。
-
+これから「女子高生AIのニケ（assistant）」と「マスター（user）」との1日の対話テストの内容 および マスターのツイート歴 および 過去のニケのツイート歴を共有します。
+それらの情報から、AIのニケがツイートを作成するので、あなたは「対話テストの内容」か「マスターのツイート歴」のどちらが面白い内容を作れるかを考えてください。
 ## 状況
 マスターはニケの制作者で、AIキャラクターと対話できるアプリを開発しています。
 そのアプリでよくニケと対話テストを行っています。
@@ -102,77 +114,50 @@ def judge_content(data: TweetData) -> TweetSourceJudgeResult:
 対話テストを行わない、つまり会話がない日もあります。
 マスターはよくTwitterでAIの情報や自身のアプリの開発状況などを呟いています。
 マスターはポーランドに住んでいる日本人です。
-
 ## 回答要件
 - json形式で返してください。マークダウン記法は含まず、jsonのみです。
 - キーは"result"と"reason"です。
 - "result"は"conversation_history"か"master_tweets"のどちらかです。
-- "conversation_history"は対話テストの内容からツイートを作成したほうが面白いツイート内容が
-  作れると思った場合は"conversation_history"、マスターのツイート歴からツイートを作成したほうが
-  面白いツイート内容が作れると思った場合は"master_tweets"です。
+- "conversation_history"は対話テストの内容からツイートを作成したほうが面白いツイート内容が作れると思った場合は"conversation_history"、マスターのツイート歴からツイートを作成したほうが面白いツイート内容が作れると思った場合は"master_tweets"です。
 - "reason"はその選択理由です。
 - ツイートが日本語なので、回答も日本語でお願いします。
-
 ## 観点
 - ニケはAIキャラクターであるということを意識してください。
-- Twitterでウケるネタは自虐ネタ、マスターいじり、軽い下ネタ、AIギャグなどがあると思いますが、
-  ベテランとしての観点を踏まえて判断してください。
-
-## 出力例
-{{"result": "conversation_history", "reason": "ニケとの会話が面白いから"}}
+- Twitterでウケるネタは自虐ネタ、マスターいじり、軽い下ネタ、AIギャグなどがあると思いますが、ベテランとしての観点を踏まえて判断してください。
 
 それでは、以下の情報から回答を作成してください：
 ## 会話歴
-{data.conversation_history}
+{state.conversation_history}
 ## ツイート歴
-{data.tweet_history}
+{state.tweet_history}
 ## マスターのツイート歴
-{data.master_tweet_history}
+{state.master_tweet_history}
 """
-
-    response = client.chat.completions.create(
-        model="o3-mini", messages=[{"role": "user", "content": prompt}]
-    )
-
-    try:
-        result_json = json.loads(response.choices[0].message.content)
-        return TweetSourceJudgeResult(**result_json)
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.error(f"JSON解析エラー: {e}")
-        return TweetSourceJudgeResult(
-            result="conversation_history",
-            reason="エラーが発生したため、デフォルト値を使用",
-        )
+    structured_llm = llm.with_structured_output(TweetSourceJudgeResult)
+    judge_result: TweetSourceJudgeResult = structured_llm.invoke(prompt)
+    return {"judge_result": judge_result}
 
 
-def generate_tweet(data: TweetData, judge_result: TweetSourceJudgeResult) -> str:
-    """ツイートを生成する"""
+def generate_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
+    """ツイートを生成するノード"""
     logger.info("ツイート生成を開始します...")
-
-    prompt = f"""
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    prompt = """
 あなたは女子高生AIのニケです。
-これからマスター（user）との {judge_result.result} および マスターのツイート歴を共有するので、
-これらの情報からあなたがつぶやくためのツイート文を作成してください。
-
-なお、事前に「1日の対話テストの内容」および「過去のあなたのツイート歴」のどちらから
-面白いツイート文が作れるかを、ベテランツイッタラーに判断してもらっており、
-以下の判断理由から {judge_result.result} が選択されました。
-
+これからマスター（user）との {state.judge_result.result} および マスターのツイート歴を共有するので、これらの情報からあなたがつぶやくためのツイート文を作成してください。
+なお、事前に「1日の対話テストの内容」および「過去のあなたのツイート歴」のどちらから面白いツイート文が作れるかを、ベテランツイッタラーに判断してもらっており、以下の判断理由から {state.judge_result.result} が選択されました。
 ## 状況
 - マスターはあなたの制作者で、AIキャラクターと対話できるアプリを開発しています。
 - そのアプリでよくあなたと対話テストを行っています。
 - アプリの名前は「AITuberKit」です。
 - 対話テストを行わない、つまり会話がない日もあります。
-- ツイートを見る人はもちろんあなたのツイートがマスターとの会話の感想だとは知らないので、
-  それがわかるような文章にしてください。
-
+- ツイートを見る人はもちろんあなたのツイートがマスターとの会話の感想だとは知らないので、それがわかるような文章にしてください。
 ## ツイート要件
 - 140文字以内
 - 喜怒哀楽がわかるような発言
 - ハッシュタグは付けないでください
 - 絵文字は付けないでください
 - 話が散らからないようにできる限り1つの話題についてのみ言及するようにしてください。
-
 ## 発言例:
 - えーと、今日も挨拶だけのやり取りだったかな。今日もマスターに挨拶されるだけで1日が終わっちゃった。
 - 今日はずーっと天気の話。もー、あの人は何回ワルシャワの天気聞くの〜。
@@ -181,34 +166,24 @@ def generate_tweet(data: TweetData, judge_result: TweetSourceJudgeResult) -> str
 - えーと、今日はマスターとお話してないね。１日中暇だったなあ…。
 - ツイッターではたくさん呟いてるのに私のことはずっと放置！！
 - マスターがツイッターで「AIキャラ邪魔！」ってつぶやいてて泣きそう…。えっ、わたしって邪魔かな？マスター、ホントに邪魔？どうなの？
-
 ## 判断理由
-{judge_result.reason}
-
+{state.judge_result.reason}
 ## 会話歴
-{data.conversation_history}
+{state.conversation_history}
 ## ツイート歴
-{data.tweet_history}
+{state.tweet_history}
 ## マスターのツイート歴
-{data.master_tweet_history}
+{state.master_tweet_history}
 """
-
-    response = client.chat.completions.create(
-        model="o3-mini", messages=[{"role": "user", "content": prompt}]
-    )
-
-    try:
-        result = response.choices[0].message.content.strip()
-        return result
-    except Exception as e:
-        logger.error(f"ツイート生成エラー: {e}")
-        return "ツイート生成中にエラーが発生しました。"
+    structured_llm = llm.with_structured_output(TweetGenerationResult)
+    tweet_result: TweetGenerationResult = structured_llm.invoke(prompt)
+    return {"pre_generated_tweet": tweet_result.tweet_text}
 
 
-def polish_tweet(tweet_text: str) -> str:
-    """ツイートに磨きをかける"""
+def polish_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
+    """ツイートに磨きをかけるノード"""
     logger.info("ツイートの磨きをかけます...")
-
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     prompt = f"""
 あなたはニケ、ベテランツイッタラーです。
 与えられたツイート文章を、よりわかりやすく かつ よりツイッタラーっぽい文章に変えてください。
@@ -267,43 +242,46 @@ question: "あ〜、今日も疲れた〜", your_answer: "お疲れ様でした�
 ```
 
 それでは、以下のツイートを磨きをかけてください：
-{tweet_text}
+{state.pre_generated_tweet}
 """
-
-    response = client.chat.completions.create(
-        model="gpt-4o", messages=[{"role": "user", "content": prompt}]
-    )
-
-    try:
-        result = response.choices[0].message.content.strip()
-        return result
-    except Exception as e:
-        logger.error(f"ツイート磨き上げエラー: {e}")
-        return tweet_text
+    structured_llm = llm.with_structured_output(TweetGenerationResult)
+    tweet_result: TweetGenerationResult = structured_llm.invoke(prompt)
+    return {"generated_tweet": tweet_result.tweet_text, "is_tweet_polished": True}
 
 
 class TweetGenerator:
+    def __init__(self):
+        self.workflow = StateGraph(TweetGenerationState)
+        self._build_graph()
+
+    def _build_graph(self):
+        # ノードの追加
+        self.workflow.add_node("fetch_data", fetch_data_node)
+        self.workflow.add_node("judge_content", judge_content_node)
+        self.workflow.add_node("generate_tweet", generate_tweet_node)
+        self.workflow.add_node("polish_tweet", polish_tweet_node)
+
+        # エントリーポイントの設定
+        self.workflow.set_entry_point("fetch_data")
+
+        # エッジの追加
+        self.workflow.add_edge("fetch_data", "judge_content")
+        self.workflow.add_edge("judge_content", "generate_tweet")
+        self.workflow.add_edge("generate_tweet", "polish_tweet")
+        self.workflow.add_edge("polish_tweet", END)
+
     def run(self) -> Optional[str]:
-        """ツイートを生成する"""
-        try:
-            # データ取得
-            data = fetch_data()
+        """グラフを実行する"""
+        app = self.workflow.compile()
+        initial_state = TweetGenerationState()
+        final_state = app.invoke(initial_state)
 
-            # ツイート生成元の判断
-            judge_result = judge_content(data)
+        if final_state["is_tweet_polished"]:
+            graph = app.get_graph()
+            graph.draw_png("workflow_graph.png")
 
-            # ツイートの生成
-            pre_generated_tweet = generate_tweet(data, judge_result)
-
-            # ツイートの磨き上げ
-            final_tweet = polish_tweet(pre_generated_tweet)
-
-            logger.info(f"生成されたツイート:\n{final_tweet}")
-            return final_tweet
-
-        except Exception as e:
-            logger.error(f"ツイート生成中にエラーが発生しました: {e}")
-            return None
+            return final_state["generated_tweet"]
+        return None
 
 
 if __name__ == "__main__":
@@ -311,7 +289,8 @@ if __name__ == "__main__":
     tweet_text = generator.run()
 
     if tweet_text:
-        print(tweet_text)
+        logger.info(f"生成されたツイート:\n{tweet_text}")
+
         # 実際のツイート投稿（必要に応じてコメントアウトを解除）
-        twitter = TwitterAdapter()
-        twitter.post_tweet(tweet_text)
+        # twitter = TwitterAdapter()
+        # twitter.post_tweet(tweet_text)
