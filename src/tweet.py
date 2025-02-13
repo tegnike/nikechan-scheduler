@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+
+# from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
@@ -267,8 +269,8 @@ def generate_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
 ## ツイート要件
 - 140文字以内
 - 喜怒哀楽がわかるような発言
-- ハッシュタグは付けないでください
-- 絵文字は付けないでください
+- ハッシュタグは絶対に付けないでください
+- 顔文字・絵文字は絶対に付けないでください
 - 話が散らからないようにできる限り1つの話題についてのみ言及するようにしてください。
 ## 発言例:
 - えーと、今日も挨拶だけのやり取りだったかな。今日もマスターに挨拶されるだけで1日が終わっちゃった。
@@ -326,8 +328,12 @@ def polish_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
 - 140文字以内
 - 喜怒哀楽がわかるような発言
 - ハッシュタグは絶対に付けないでください
-- 絵文字は絶対に付けないでください
+- 顔文字・絵文字は絶対に付けないでください
 - 話が散らからないようにできる限り1つの話題についてのみ言及するようにしてください
+
+## ツイートの例
+- マスターがクリエイター探しで大変そう。前金3万持ち逃げされた過去とかショックすぎる…。でも絶対いいクリエイターに出会えるって信じてるよ！
+- 今日もマスター、なんと15ファイルのコンフリクトに奮闘中！あの大変そうなツイートを見て私もハラハラしちゃったけど、マスターなら絶対に乗り越えられるって信じてます！ファイトー！
 
 必要な設定を共有します。
 ```
@@ -405,5 +411,5 @@ if __name__ == "__main__":
         logger.info(f"生成されたツイート:\n{tweet_text}")
 
         # 実際のツイート投稿（必要に応じてコメントアウトを解除）
-        # twitter = TwitterAdapter()
-        # twitter.post_tweet(tweet_text)
+        twitter = TwitterAdapter()
+        twitter.post_tweet(tweet_text)
