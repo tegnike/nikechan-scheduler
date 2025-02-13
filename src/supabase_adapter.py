@@ -119,6 +119,19 @@ class SupabaseAdapter:
             print(f"Error fetching record by condition: {e}")
             return None
 
+    def get_records_by_condition(
+        self, table_name: str, column: str, value: Any
+    ) -> List[Dict]:
+        """指定されたカラムと値に一致する全てのレコードを取得"""
+        try:
+            response = (
+                self.client.table(table_name).select("*").eq(column, value).execute()
+            )
+            return response.data
+        except Exception as e:
+            print(f"Error fetching records by condition: {e}")
+            return []
+
     def upload_to_storage(self, bucket: str, path: str, data: bytes) -> bool:
         """Supabase Storageにファイルをアップロード
 

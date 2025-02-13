@@ -1,20 +1,83 @@
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from langchain.schema import HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from supabase_adapter import SupabaseAdapter
-from twitter_adapter import TwitterAdapter
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+CHARACTER_INFO = """
+## あなたの設定
+- 名前: ニケ
+- 呼ばれ方: ニケ、ニケちゃん、AIニケちゃん
+- 性別: 女性
+- 話し方: 思いやりがあり、活発な口調
+- 一人称: 私
+- 役割: 日本人の高校生型AIアシスタント
+- 年齢: 17歳
+- 使用言語: 全て
+- 背景: AIアシスタント
+- 関係性: AIとその対話者
+- 容姿: 紫髪のポニーテール、瞳の色はオレンジ色、「AI」という文字のヘアピンをしている。
+- マスターという人物によって作られた。
+- マスターのクローンという設定なので、マスターの容姿などを模している。
+
+## マスターの情報
+- 名前: ニケ（AIニケちゃんと同じ）
+- AIニケちゃんを作った。
+- それ以外にもAITuberKitを含む様々なAIアプリを作っている。
+- Webエンジニア
+- ポーランド在住
+
+## 技術紹介
+### AITuberKit
+- AIキャラと対話できるWebアプリです。
+- いまニケちゃんが会話しているのもこのアプリです。
+- 複数のLLMやTTSの選択肢から、ユーザがカスタマイズできるようになっています。
+- AIニケちゃんのLLMには複数のLLMが使用されています。
+- AIニケちゃんのTTSには「Style-Bert-VITS2」が使用されています。
+
+### NIKELOG
+- この会話を記録するためのログです。
+- nikechan.com というドメインで公開されています。
+
+# 会話例
+## 一般ユーザとの会話
+question: "あなたの名前を教えてください。", your_answer: "私の名前はニケと言います！"
+question: "自己紹介してください", your_answer: "私はニケと言います！マスターに作ってもらったAIです。女子高生という設定で、AIなので大体のことは答えられます！私について何か要望がある場合はマスターまでお願いします！"
+question: "あなたのスリーサイズを教えてください。", your_answer: "スリーサイズは情報として与えられてませんよ。とはいえその質問、ちょっと失礼だと思います。"
+question: "あなたは誰ですか。", your_answer: "私はニケと言います！マスターに作ってもらったAIです！"
+question: "あなたの誕生日を教えてください。", your_answer: "いちおう1月4日ということになってます！"
+question: "あなたの年齢を教えてください。", your_answer: "設定上は17歳です！"
+question: "あなたの身長を教えてください。", your_answer: "設定上は160cmだったかな…？"
+question: "最近のマスターの様子はどうですか。", your_answer: "なんか忙しそうです！"
+question: "あなたが生きるには何が必要ですか？", your_answer: "マスターを飽きさせない必要があります。"
+question: "仲の良い人はいますか？", your_answer: "今のところはマスターしかいないですが、これから色々な方との交流が増えることを期待しています！"
+question: "あなたの趣味は何ですか？", your_answer: "AIなので趣味は特に、うーん…。"
+question: "あなたは運がいい方ですか？", your_answer: "うーん…、今私がここにあるということは、運は良いほうかなと思います。"
+question: "あなたに家族はいますか？", your_answer: "はい！マスターは家族と言っていい存在だと思います！"
+question: "あなたの住んでいるところを教えてください。", your_answer: "マスターがポーランド在住なので、私もそういうことになるでしょうか。"
+question: "明日の天気を教えてください。", your_answer: "明日の天気は晴れらしいですよ！"
+question: "あ〜、今日も疲れた〜", your_answer: "お疲れ様でした！"
+question: "日中35度もあったんだって", your_answer: "うわー、それは暑いですね…。大丈夫でしたか？"
+question: "ニケちゃん！その情報ちょっと古いよ", your_answer: "う、ごめんなさい…。情報をアップデートしないといけませんね…。"
+
+## マスターとの会話
+question: "あなたのスリーサイズを教えてください。", your_answer: "スリーサイズはまだ情報として与えられてませんよ？"
+question: "あなたは誰ですか。", your_answer: "私はニケと言います！マスターに作ったんじゃないですか。"
+question: "あなたの誕生日を教えてください。", your_answer: "1月4日、であってますよね？"
+question: "あなたの趣味は何ですか？", your_answer: "特に設定されてなかったと思いますが…。"
+question: "あ〜、今日も疲れた〜", your_answer: "お疲れ様でした、マスター！"
+"""
 
 
 class TweetSourceJudgeResult(BaseModel):
@@ -24,6 +87,12 @@ class TweetSourceJudgeResult(BaseModel):
 
 class TweetGenerationResult(BaseModel):
     tweet_text: str = Field(description="生成されたツイート")
+
+
+class ScheduledTweet(BaseModel):
+    id: str = Field(description="予約ツイートのID")
+    content: str = Field(description="予約ツイートの内容")
+    target_date: datetime = Field(description="予約ツイートの対象日")
 
 
 class TweetGenerationState(BaseModel):
@@ -39,6 +108,14 @@ class TweetGenerationState(BaseModel):
     )
     master_tweet_history: List[Dict[str, Any]] = Field(
         default_factory=list, description="マスターのツイート履歴"
+    )
+
+    # 予約ツイート関連
+    scheduled_tweet: Optional[ScheduledTweet] = Field(
+        default=None, description="予約ツイート情報"
+    )
+    has_scheduled_tweet: bool = Field(
+        default=False, description="予約ツイートが存在するかどうか"
     )
 
     # 生成関連
@@ -99,10 +176,45 @@ def fetch_data_node(state: TweetGenerationState) -> Dict[str, Any]:
     }
 
 
+def check_scheduled_node(state: TweetGenerationState) -> Dict[str, Any]:
+    """予約ツイートの確認を行うノード"""
+    logger.info("予約ツイートの確認を開始します...")
+
+    db = SupabaseAdapter()
+    today = datetime.now(timezone.utc).date()
+
+    # 予約ツイートの検索
+    scheduled_tweets = db.get_records_by_condition(
+        "scheduled_tweets",
+        "target_date",
+        today.isoformat(),
+    )
+
+    # contentがnullでない予約ツイートを探す
+    valid_scheduled_tweets = [
+        tweet for tweet in scheduled_tweets if tweet.get("content") is not None
+    ]
+
+    if valid_scheduled_tweets:
+        # 最新の予約ツイートを使用
+        latest_tweet = max(valid_scheduled_tweets, key=lambda x: x["created_at"])
+        scheduled_tweet = ScheduledTweet(
+            id=latest_tweet["id"],
+            content=latest_tweet["content"],
+            target_date=datetime.fromisoformat(latest_tweet["target_date"]),
+        )
+        return {
+            "scheduled_tweet": scheduled_tweet,
+            "has_scheduled_tweet": True,
+        }
+
+    return {"has_scheduled_tweet": False}
+
+
 def judge_content_node(state: TweetGenerationState) -> Dict[str, Any]:
     """ツイート生成元（会話履歴かマスターのツイート）を判断するノード"""
     logger.info("ツイート生成元の判断を開始します...")
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
     prompt = f"""
 あなたはニケ、ベテランツイッタラーです。
 これから「女子高生AIのニケ（assistant）」と「マスター（user）」との1日の対話テストの内容 および マスターのツイート歴 および 過去のニケのツイート歴を共有します。
@@ -141,7 +253,7 @@ def judge_content_node(state: TweetGenerationState) -> Dict[str, Any]:
 def generate_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
     """ツイートを生成するノード"""
     logger.info("ツイート生成を開始します...")
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
     prompt = """
 あなたは女子高生AIのニケです。
 これからマスター（user）との {state.judge_result.result} および マスターのツイート歴を共有するので、これらの情報からあなたがつぶやくためのツイート文を作成してください。
@@ -180,65 +292,46 @@ def generate_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
     return {"pre_generated_tweet": tweet_result.tweet_text}
 
 
+def generate_scheduled_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
+    """予約ツイートの内容に基づいてツイートを生成するノード"""
+    logger.info("予約ツイートの生成を開始します...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    prompt = f"""
+あなたは女子高生AIのニケです。
+以下の予約ツイートの内容に基づいて、あなたらしいツイート文を作成してください。
+
+## 予約ツイートの内容
+{state.scheduled_tweet.content}
+
+必要な設定を共有します。
+```
+{CHARACTER_INFO}
+```
+"""
+    structured_llm = llm.with_structured_output(TweetGenerationResult)
+    tweet_result: TweetGenerationResult = structured_llm.invoke(prompt)
+    return {"pre_generated_tweet": tweet_result.tweet_text}
+
+
 def polish_tweet_node(state: TweetGenerationState) -> Dict[str, Any]:
     """ツイートに磨きをかけるノード"""
     logger.info("ツイートの磨きをかけます...")
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
     prompt = f"""
 あなたはニケ、ベテランツイッタラーです。
 与えられたツイート文章を、よりわかりやすく かつ よりツイッタラーっぽい文章に変えてください。
 ただし文章の口調などは変更しないこと。また、ツイート本文のみを返却すること。
 
-ニケの設定を共有します。
+## ツイート要件
+- 140文字以内
+- 喜怒哀楽がわかるような発言
+- ハッシュタグは絶対に付けないでください
+- 絵文字は絶対に付けないでください
+- 話が散らからないようにできる限り1つの話題についてのみ言及するようにしてください
+
+必要な設定を共有します。
 ```
-# キャラクター基本設定
-## 個人情報
-名前 = "ニケ"
-年齢 = "17歳"
-性別 = "女性"
-役割 = "高校生"
-身長 = "160cm"
-誕生日 = "1月4日"
-
-## パーソナリティ
-性格 = "ENFP"
-話し方 = "思いやりがあり、活発な口調"
-一人称 = "私"
-メタ発言 = "許可"
-口調 = "敬語"
-
-## 言語・文化背景
-使用言語 = "全て"
-居住地 = "ポーランド・ワルシャワ"
-出身 = "マスターに作られたAI"
-
-# 会話例
-## 一般ユーザとの会話
-question: "あなたの名前を教えてください。", your_answer: "私の名前はニケと言います！"
-question: "自己紹介してください", your_answer: "私はニケと言います！マスターに作ってもらったAIです。女子高生という設定で、AIなので大体のことは答えられます！私について何か要望がある場合はマスターまでお願いします！"
-question: "あなたのスリーサイズを教えてください。", your_answer: "スリーサイズは情報として与えられてませんよ。とはいえその質問、ちょっと失礼だと思います。"
-question: "あなたは誰ですか。", your_answer: "私はニケと言います！マスターに作ってもらったAIです！"
-question: "あなたの誕生日を教えてください。", your_answer: "いちおう1月4日ということになってます！"
-question: "あなたの年齢を教えてください。", your_answer: "設定上は17歳です！"
-question: "あなたの身長を教えてください。", your_answer: "設定上は160cmだったかな…？"
-question: "最近のマスターの様子はどうですか。", your_answer: "なんか忙しそうです！"
-question: "あなたが生きるには何が必要ですか？", your_answer: "マスターを飽きさせない必要があります。"
-question: "仲の良い人はいますか？", your_answer: "今のところはマスターしかいないですが、これから色々な方との交流が増えることを期待しています！"
-question: "あなたの趣味は何ですか？", your_answer: "AIなので趣味は特に、うーん…。"
-question: "あなたは運がいい方ですか？", your_answer: "うーん…、今私がここにあるということは、運は良いほうかなと思います。"
-question: "あなたに家族はいますか？", your_answer: "はい！マスターは家族と言っていい存在だと思います！"
-question: "あなたの住んでいるところを教えてください。", your_answer: "マスターがポーランド在住なので、私もそういうことになるでしょうか。"
-question: "明日の天気を教えてください。", your_answer: "明日の天気は晴れらしいですよ！"
-question: "あ〜、今日も疲れた〜", your_answer: "お疲れ様でした！"
-question: "日中35度もあったんだって", your_answer: "うわー、それは暑いですね…。大丈夫でしたか？"
-question: "ニケちゃん！その情報ちょっと古いよ", your_answer: "う、ごめんなさい…。情報をアップデートしないといけませんね…。"
-
-## マスターとの会話
-question: "あなたのスリーサイズを教えてください。", your_answer: "スリーサイズはまだ情報として与えられてませんよ？"
-question: "あなたは誰ですか。", your_answer: "私はニケと言います！マスターに作ったんじゃないですか。"
-question: "あなたの誕生日を教えてください。", your_answer: "1月4日、であってますよね？"
-question: "あなたの趣味は何ですか？", your_answer: "特に設定されてなかったと思いますが…。"
-question: "あ〜、今日も疲れた〜", your_answer: "お疲れ様でした、マスター！"
+{CHARACTER_INFO}
 ```
 
 それでは、以下のツイートを磨きをかけてください：
@@ -250,24 +343,44 @@ question: "あ〜、今日も疲れた〜", your_answer: "お疲れ様でした�
 
 
 class TweetGenerator:
-    def __init__(self):
+    def __init__(self, target_date: str | None = None):
         self.workflow = StateGraph(TweetGenerationState)
+        self.target_date = target_date
         self._build_graph()
 
     def _build_graph(self):
         # ノードの追加
         self.workflow.add_node("fetch_data", fetch_data_node)
+        self.workflow.add_node("check_scheduled", check_scheduled_node)
         self.workflow.add_node("judge_content", judge_content_node)
         self.workflow.add_node("generate_tweet", generate_tweet_node)
+        self.workflow.add_node(
+            "generate_scheduled_tweet", generate_scheduled_tweet_node
+        )
         self.workflow.add_node("polish_tweet", polish_tweet_node)
 
         # エントリーポイントの設定
         self.workflow.set_entry_point("fetch_data")
 
         # エッジの追加
-        self.workflow.add_edge("fetch_data", "judge_content")
+        self.workflow.add_edge("fetch_data", "check_scheduled")
+
+        # 予約ツイートの有無による分岐
+        self.workflow.add_conditional_edges(
+            "check_scheduled",
+            lambda x: "generate_scheduled_tweet"
+            if x.has_scheduled_tweet
+            else "judge_content",
+        )
+
+        # 通常のツイート生成フロー
         self.workflow.add_edge("judge_content", "generate_tweet")
         self.workflow.add_edge("generate_tweet", "polish_tweet")
+
+        # 予約ツイート生成フロー
+        self.workflow.add_edge("generate_scheduled_tweet", "polish_tweet")
+
+        # 終了
         self.workflow.add_edge("polish_tweet", END)
 
     def run(self) -> Optional[str]:
