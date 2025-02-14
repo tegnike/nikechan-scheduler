@@ -10,6 +10,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from supabase_adapter import SupabaseAdapter
+from twitter_adapter import TwitterAdapter
 
 load_dotenv()
 

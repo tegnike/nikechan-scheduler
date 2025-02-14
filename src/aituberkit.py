@@ -714,12 +714,39 @@ def summarize_issues_node(state: AnalysisState) -> Dict[str, Any]:
 def create_podcast_text_node(state: AnalysisState) -> Dict[str, Any]:
     """ポッドキャストのテキストを作成するノード"""
     logger.info("ポッドキャストのテキスト作成を開始します...")
+
+    db = SupabaseAdapter()
+
+    # 前日のポッドキャストテキストを取得
+    target_date = state.target_date or datetime.now(timezone.utc).date()
+    prev_date = target_date - timedelta(days=1)
+    prev_summary = db.get_record_by_condition(
+        "daily_summaries", "target_date", prev_date.isoformat()
+    )
+    prev_podcast_text = prev_summary["podcast"] if prev_summary else None
+
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
     summarize_prompt = PromptTemplate.from_template("""
 あなたは、AITuberKitのAIキャラ「ニケ」です。あなたの役割は、提供された1日の会話データを基に、ポッドキャスト向けの会話要約スクリプトを作成することです。
 
+## 前日のポッドキャスト
+{prev_podcast_text}
+
 ## 指示内容
 以下のJSONデータを分析し、ポッドキャストで話すのに適した口調で、1日分の会話を振り返るスクリプトを作成してください。出力は、ニケが語り手となり、ユーザーが自然に聞き取れる流れで構成してください。
+
+## 前日との比較について
+前日のポッドキャストと比較して、以下のような著しい差分がある場合は、自然な形で言及してください：
+- ユーザー数や会話数が大きく変化した場合（例：1.5倍以上の増加や半分以下の減少）
+- トピックの傾向が大きく異なる場合（例：前日は技術的な話題が中心だったが、今日は趣味の話題が中心など）
+- 会話の時間帯の傾向が大きく異なる場合（例：前日は夜間が中心だったが、今日は昼間が中心など）
+- 新しい種類の問題や改善点が発見された場合
+
+ただし、差分への言及は以下の点に注意してください：
+- 自然な会話の流れを損なわない程度に留める
+- 数値の羅列は避け、傾向の変化を分かりやすく表現する
+- ネガティブな表現は避け、建設的な表現を心がける
+- 差分が著しくない場合は、あえて言及する必要はない
 
 ## 出力要件
 - **会話の流れを意識して、スムーズに繋がる文章を作成すること**
@@ -788,7 +815,9 @@ AITuberKitの会話の質を振り返ると、いくつかの課題が見えて�
                 "user_metrics": state.user_metrics,
                 "topic_metrics": state.topic_metrics,
                 "conversation_metrics": state.conversation_metrics,
-            }
+            },
+            "prev_podcast_text": prev_podcast_text
+            or "前日のポッドキャストはありません。",
         }
     )
 
