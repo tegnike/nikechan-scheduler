@@ -48,8 +48,8 @@ class TwitterAdapter:
             response = self.client.create_tweet(text=text)
             print("ツイートの投稿に成功しました！")
 
-            # tweetsテーブルにツイート内容を保存
-            tweet_data = {"content": text}
+            # tweetsテーブルにツイート内容とIDを保存
+            tweet_data = {"content": text, "tweet_id": response.data["id"]}
             self.db.insert_record("tweets", tweet_data)
             print("ツイート内容をデータベースに保存しました")
 

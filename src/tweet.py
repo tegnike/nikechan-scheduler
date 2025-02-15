@@ -413,4 +413,5 @@ if __name__ == "__main__":
 
         # 実際のツイート投稿（必要に応じてコメントアウトを解除）
         twitter = TwitterAdapter()
-        twitter.post_tweet(tweet_text)
+        response = twitter.post_tweet(tweet_text)
+        print(response)
