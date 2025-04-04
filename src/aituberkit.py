@@ -186,7 +186,11 @@ def parse_datetime(dt_str: str) -> datetime:
 
 def get_conversation(session: Session) -> str:
     """セッションの会話を文字列に変換"""
-    return "\n".join(f"{msg.role}: {msg.content}" for msg in session.messages)
+    conversation = "\n".join(
+        f"{msg.role}: {msg.content[:300]}" for msg in session.messages
+    )
+    print(f"conversation: {len(conversation)}")
+    return conversation
 
 
 def convert_english_to_japanese(text: str) -> str:
@@ -233,24 +237,21 @@ def synthesize_voice(text: str, output_file: str) -> bool:
         query_url = f"{server_url}/audio_query?speaker={speaker}&text={quote(text)}"
         query_response = requests.post(
             query_url,
-            headers={
-                "Content-Type": "application/json",
-                "X-API-Key": api_key
-            },
-            timeout=30
+            headers={"Content-Type": "application/json", "X-API-Key": api_key},
+            timeout=30,
         )
-        
+
         if query_response.status_code != 200:
             logger.error(f"Audio query failed: {query_response.status_code}")
             return False
-            
+
         query_data = query_response.json()
-        
+
         # 必要に応じてパラメータを調整
         query_data["speedScale"] = 1.0
         query_data["pitchScale"] = 0.0
         query_data["intonationScale"] = 1.0
-        
+
         # 2. 音声合成
         synthesis_url = f"{server_url}/synthesis?speaker={speaker}"
         synthesis_response = requests.post(
@@ -259,19 +260,19 @@ def synthesize_voice(text: str, output_file: str) -> bool:
             headers={
                 "Content-Type": "application/json",
                 "Accept": "audio/wav",
-                "X-API-Key": api_key
+                "X-API-Key": api_key,
             },
-            timeout=30
+            timeout=30,
         )
-        
+
         if synthesis_response.status_code != 200:
             logger.error(f"Synthesis failed: {synthesis_response.status_code}")
             return False
-            
+
         # 音声ファイルを保存
         with open(output_file, "wb") as f:
             f.write(synthesis_response.content)
-            
+
         return True
     except Exception as e:
         logger.error(f"Error in AIVISpeech TTS: {e}")
@@ -360,14 +361,13 @@ def organize_sessions_node(state: AnalysisState) -> Dict[str, Any]:
     start_utc = start_dt.astimezone(timezone.utc)
     end_utc = end_dt.astimezone(timezone.utc)
 
-    # 指定日付のメッセージのみを処理する    
+    # 指定日付のメッセージのみを処理する
     filtered_messages = [
-        msg for msg in state.messages 
-        if start_utc <= msg.created_at < end_utc
+        msg for msg in state.messages if start_utc <= msg.created_at < end_utc
     ]
 
     sessions_dict: Dict[str, List[Message]] = {}
-    for msg in filtered_messages[:50]:
+    for msg in filtered_messages:
         if msg.session_id not in sessions_dict:
             sessions_dict[msg.session_id] = []
         sessions_dict[msg.session_id].append(msg)
