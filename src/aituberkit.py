@@ -348,8 +348,26 @@ def organize_sessions_node(state: AnalysisState) -> Dict[str, Any]:
     """メッセージをセッション単位に整理するノード"""
     logger.info("セッションの整理を開始します...")
 
+    # 指定された日付がある場合は使用し、なければ現在日付を使用
+    target_date = state.target_date or datetime.now(timezone.utc).date()
+
+    # 日本時間の00:00をUTCに変換
+    jst = timezone(timedelta(hours=9))
+    start_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=jst)
+    end_dt = start_dt + timedelta(days=1)
+
+    # UTCに変換
+    start_utc = start_dt.astimezone(timezone.utc)
+    end_utc = end_dt.astimezone(timezone.utc)
+
+    # 指定日付のメッセージのみを処理する    
+    filtered_messages = [
+        msg for msg in state.messages 
+        if start_utc <= msg.created_at < end_utc
+    ]
+
     sessions_dict: Dict[str, List[Message]] = {}
-    for msg in state.messages:
+    for msg in filtered_messages[:50]:
         if msg.session_id not in sessions_dict:
             sessions_dict[msg.session_id] = []
         sessions_dict[msg.session_id].append(msg)
