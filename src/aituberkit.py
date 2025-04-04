@@ -220,36 +220,62 @@ def convert_english_to_japanese(text: str) -> str:
 
 def synthesize_voice(text: str, output_file: str) -> bool:
     """音声合成APIを呼び出して音声ファイルを生成する"""
-    url = "https://ab269viny4ztmt-5000.proxy.runpod.net/voice"
+    speaker = "40618528"  # 適切なスピーカーID
+    server_url = "http://127.0.0.1:10102"  # AIVISpeechサーバーのURL
+    api_key = os.getenv("AIVIS_SPEECH_API_KEY")  # 環境変数からAPIキーを取得
 
-    params = {
-        "text": text,
-        "model_id": "10",
-        "sdp_ratio": "0.8",
-        "noise": "0.6",
-        "noisew": "0.8",
-        "length": "1.1",
-        "language": "JP",
-        "auto_split": "true",
-        "split_interval": "0.5",
-        "assist_text_weight": "1",
-        "style": "Neutral",
-        "style_weight": "1",
-    }
+    if not api_key:
+        logger.error("AIVIS_SPEECH_API_KEY環境変数が設定されていません")
+        return False
 
-    headers = {"accept": "audio/wav", "X-API-TOKEN": "3627533934632785"}
-
-    # URLエンコードされたパラメータを含むURLを構築
-    query = "&".join([f"{k}={quote(str(v))}" for k, v in params.items()])
-    full_url = f"{url}?{query}"
-
-    response = requests.get(full_url, headers=headers)
-
-    if response.status_code == 200:
+    try:
+        # 1. Audio Query の生成
+        query_url = f"{server_url}/audio_query?speaker={speaker}&text={quote(text)}"
+        query_response = requests.post(
+            query_url,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": api_key
+            },
+            timeout=30
+        )
+        
+        if query_response.status_code != 200:
+            logger.error(f"Audio query failed: {query_response.status_code}")
+            return False
+            
+        query_data = query_response.json()
+        
+        # 必要に応じてパラメータを調整
+        query_data["speedScale"] = 1.0
+        query_data["pitchScale"] = 0.0
+        query_data["intonationScale"] = 1.0
+        
+        # 2. 音声合成
+        synthesis_url = f"{server_url}/synthesis?speaker={speaker}"
+        synthesis_response = requests.post(
+            synthesis_url,
+            json=query_data,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "audio/wav",
+                "X-API-Key": api_key
+            },
+            timeout=30
+        )
+        
+        if synthesis_response.status_code != 200:
+            logger.error(f"Synthesis failed: {synthesis_response.status_code}")
+            return False
+            
+        # 音声ファイルを保存
         with open(output_file, "wb") as f:
-            f.write(response.content)
+            f.write(synthesis_response.content)
+            
         return True
-    return False
+    except Exception as e:
+        logger.error(f"Error in AIVISpeech TTS: {e}")
+        return False
 
 
 def combine_audio_files(audio_files: List[str], output_file: str) -> None:
