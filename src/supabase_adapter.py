@@ -87,21 +87,44 @@ class SupabaseAdapter:
             List[Dict]: 該当するレコードのリスト
         """
         try:
-            query = self.client.table(table_name).select("*")
+            all_records = []
+            page = 0
+            page_size = 1000  # Supabaseの1回のクエリでの最大取得件数
 
-            if start_date:
-                query = query.gte("created_at", start_date.isoformat())
-            else:
-                if end_date is None:
-                    end_date = datetime.now(timezone.utc)
-                start_date = end_date - timedelta(days=days)
-                query = query.gte("created_at", start_date.isoformat())
+            while True:
+                query = self.client.table(table_name).select("*")
 
-            if end_date:
-                query = query.lt("created_at", end_date.isoformat())
+                if start_date:
+                    query = query.gte("created_at", start_date.isoformat())
+                else:
+                    if end_date is None:
+                        end_date = datetime.now(timezone.utc)
+                    start_date = end_date - timedelta(days=days)
+                    query = query.gte("created_at", start_date.isoformat())
 
-            response = query.execute()
-            return response.data
+                if end_date:
+                    query = query.lt("created_at", end_date.isoformat())
+
+                # ページネーションの設定
+                query = query.range(page * page_size, (page + 1) * page_size - 1)
+
+                # データの取得
+                response = query.execute()
+                current_page_data = response.data
+
+                # データが存在しない場合はループを終了
+                if not current_page_data:
+                    break
+
+                all_records.extend(current_page_data)
+
+                # 取得したデータが1ページ分に満たない場合はループを終了
+                if len(current_page_data) < page_size:
+                    break
+
+                page += 1
+
+            return all_records
         except Exception as e:
             print(f"Error fetching records by date range: {e}")
             return []
