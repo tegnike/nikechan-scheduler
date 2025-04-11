@@ -577,7 +577,7 @@ def analyze_conversation_metrics_node(
 {{
     "language": "言語名",
     "timezone": "タイムゾーン名",
-    "offset": "プラスマイナス何時間か"
+    "offset": "日本と比較したときの時差（時間単位、必ず整数で返す）"
 }}
 
 例：
@@ -589,7 +589,7 @@ def analyze_conversation_metrics_node(
 """)
         chain = prompt | llm.with_structured_output(LanguageMetrics)
         language_metrics: LanguageMetrics = chain.invoke({"conversation": conversation})
-        offset: int = language_metrics.offset
+        offset: int = round(language_metrics.offset)
 
         # 時間帯の分析（最初のメッセージの作成時間を使用）
         hour = session.messages[0].created_at.hour + offset
