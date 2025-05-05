@@ -49,16 +49,26 @@ class SupabaseAdapter:
             return None
 
     def update_record(
-        self, table_name: str, record_id: int, data: Dict
+        self,
+        table_name: str,
+        identifier_column: str,
+        identifier_value: Any,
+        data: Dict,
     ) -> Optional[Dict]:
-        """レコードを更新"""
+        """指定されたカラムと値に一致するレコードを更新"""
         try:
             response = (
-                self.client.table(table_name).update(data).eq("id", record_id).execute()
+                self.client.table(table_name)
+                .update(data)
+                .eq(identifier_column, identifier_value)
+                .execute()
             )
+            # 更新されたレコードが返ってくるか確認 (返ってこない場合もある)
             return response.data[0] if response.data else None
         except Exception as e:
-            print(f"Error updating record: {e}")
+            print(
+                f"Error updating record where {identifier_column}={identifier_value}: {e}"
+            )
             return None
 
     def delete_record(self, table_name: str, record_id: int) -> bool:
@@ -155,6 +165,20 @@ class SupabaseAdapter:
             print(f"Error fetching records by condition: {e}")
             return []
 
+    def get_records_by_column_values(
+        self, table_name: str, column: str, values: List[Any]
+    ) -> List[Dict]:
+        """指定されたカラムの値リストに一致するレコードを取得"""
+        try:
+            # Supabaseの `in_` フィルタを使用
+            response = (
+                self.client.table(table_name).select("*").in_(column, values).execute()
+            )
+            return response.data
+        except Exception as e:
+            print(f"Error fetching records by column values: {e}")
+            return []
+
     def upload_to_storage(self, bucket: str, path: str, data: bytes) -> bool:
         """Supabase Storageにファイルをアップロード
 
@@ -184,6 +208,31 @@ class SupabaseAdapter:
             str: ファイルの公開URL
         """
         return self.client.storage.from_(bucket).get_public_url(path)
+
+    def upsert_records(
+        self, table_name: str, records: List[Dict], on_conflict: str
+    ) -> List[Dict]:
+        """複数のレコードをUpsert (Insert or Update)
+
+        Args:
+            table_name (str): テーブル名
+            records (List[Dict]): 挿入または更新するレコードのリスト
+            on_conflict (str): コンフリクトが発生した場合に
+                               一意性を判断するカラム名
+
+        Returns:
+            List[Dict]: Upsertされたレコードのリスト
+        """
+        try:
+            response = (
+                self.client.table(table_name)
+                .upsert(records, on_conflict=on_conflict)
+                .execute()
+            )
+            return response.data
+        except Exception as e:
+            print(f"Error upserting records: {e}")
+            return []
 
 
 # テスト実行用コード
